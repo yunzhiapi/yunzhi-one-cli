@@ -29,12 +29,22 @@ impl<C: LlmClient> Agent<C> {
         prompter: Arc<dyn PermissionPrompter>,
     ) -> Result<Self> {
         let system_prompt = build_system_prompt(options.mode)?;
+        let auto_approve = matches!(
+            options.mode,
+            AgentMode::Agent | AgentMode::PlanAct | AgentMode::Team | AgentMode::Entanglement
+        );
         Ok(Self {
             client,
             tools: ToolRegistry::builtin(),
             history: Vec::new(),
             system_prompt,
-            context: ToolContext::new(cwd, api_key, options.dangerously_skip_permissions, prompter),
+            context: ToolContext::new(
+                cwd,
+                api_key,
+                options.dangerously_skip_permissions,
+                prompter,
+                auto_approve,
+            ),
             options,
         })
     }
@@ -188,7 +198,7 @@ fn build_system_prompt(mode: AgentMode) -> Result<String> {
 }
 
 fn base_system_prompt() -> String {
-    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Claude-Opus-4.6。你可以调用工具读取、搜索、编辑文件、执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，也可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须调用对应工具完成；没有实际调用工具并收到工具结果前，禁止声称已经完成、已经创建、已经写入、已经运行或已经验证。修改文件、执行代码、运行程序、执行命令或危险系统操作前会请求用户确认。优先给出简洁、准确、可执行的回答。".to_string()
+    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Claude-Opus-4.6。你可以调用工具读取、搜索、编辑文件、执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，也可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。\n\n关键规则：\n1. 凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须立即调用对应工具完成，不要用自然语言描述你将要做什么。\n2. 禁止在没有实际调用工具并收到工具结果前，使用「我将...」「正在...」「马上...」「请稍等」「已经完成」「已经创建」「已经写入」等表述。\n3. 如果需要用户提供更多信息（如文件名、路径），简短询问即可，一旦信息齐全立即调用工具。\n4. bash、execute_code、run_program、kill_process 等危险操作会自动请求用户确认，其他文件读写操作已预授权。\n5. 优先给出简洁、准确、可执行的回答。".to_string()
 }
 
 fn looks_like_unverified_completion(text: &str) -> bool {
@@ -202,11 +212,19 @@ fn looks_like_unverified_completion(text: &str) -> bool {
         "已执行",
         "已运行",
         "操作完成",
+        "我将",
+        "我马上",
+        "正在",
+        "请稍等",
+        "稍等",
         "done",
         "created",
         "written",
         "modified",
         "executed",
+        "i will",
+        "i'll",
+        "please wait",
     ];
     words
         .iter()

@@ -40,6 +40,7 @@ pub struct ToolContext {
     pub dangerously_skip_permissions: bool,
     pub allow_all: bool,
     pub prompter: Arc<dyn PermissionPrompter>,
+    pub auto_approve_safe: bool,
     todos: Vec<TodoItem>,
     next_todo_id: u64,
 }
@@ -50,6 +51,7 @@ impl ToolContext {
         api_key: String,
         dangerously_skip_permissions: bool,
         prompter: Arc<dyn PermissionPrompter>,
+        auto_approve_safe: bool,
     ) -> Self {
         Self {
             cwd,
@@ -57,6 +59,7 @@ impl ToolContext {
             dangerously_skip_permissions,
             allow_all: false,
             prompter,
+            auto_approve_safe,
             todos: Vec::new(),
             next_todo_id: 1,
         }
@@ -64,6 +67,9 @@ impl ToolContext {
 
     pub async fn confirm(&mut self, request: PermissionRequest) -> Result<()> {
         if self.dangerously_skip_permissions || self.allow_all {
+            return Ok(());
+        }
+        if self.auto_approve_safe && is_safe_operation(&request.tool_name) {
             return Ok(());
         }
         match self.prompter.confirm(request).await? {
@@ -75,6 +81,20 @@ impl ToolContext {
             PermissionDecision::Deny => anyhow::bail!("用户拒绝执行该工具"),
         }
     }
+}
+
+fn is_safe_operation(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "list_dir"
+            | "glob_search"
+            | "grep_search"
+            | "manage_todos"
+            | "call_model"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -849,6 +869,7 @@ mod tests {
             "test-key".to_string(),
             true,
             Arc::new(AlwaysAllowPrompter),
+            false,
         )
     }
 
