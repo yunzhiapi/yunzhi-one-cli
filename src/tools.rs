@@ -3506,11 +3506,6 @@ fn build_docx(document: &DocumentData, template: bool) -> Result<Vec<u8>> {
 }
 
 fn build_pptx(presentation: &PresentationData, template: bool) -> Result<Vec<u8>> {
-    let content_type = if template {
-        PPTX_TEMPLATE_CONTENT_TYPES
-    } else {
-        PPTX_CONTENT_TYPES
-    };
     let mut slides = Vec::with_capacity(presentation.slides.len() + 1);
     slides.push(SlideData {
         title: presentation.title.clone(),
@@ -3524,7 +3519,10 @@ fn build_pptx(presentation: &PresentationData, template: bool) -> Result<Vec<u8>
         slides,
     };
     let mut entries = vec![
-        ZipEntry::deflated("[Content_Types].xml", content_type.as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "[Content_Types].xml",
+            build_pptx_content_types(packaged.slides.len(), template).into_bytes(),
+        ),
         ZipEntry::deflated("_rels/.rels", PPTX_RELS.as_bytes().to_vec()),
         ZipEntry::deflated(
             "ppt/presentation.xml",
@@ -3747,13 +3745,109 @@ fn build_presentation_rels(slide_count: usize) -> String {
     format!("{}{}{}", RELS_PREFIX, relationships, RELS_SUFFIX)
 }
 
-fn build_slide_xml(slide: &SlideData) -> String {
-    let mut body = format!("{}\n{}", slide.title, slide.bullets.join("\n"));
-    if !slide.notes.is_empty() {
-        body.push('\n');
-        body.push_str(&slide.notes);
+fn build_pptx_content_types(slide_count: usize, template: bool) -> String {
+    let presentation_content_type = if template {
+        "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"
+    } else {
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+    };
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/ppt/presentation.xml\" ContentType=\"{}\"/>",
+        presentation_content_type
+    );
+    for index in 1..=slide_count {
+        xml.push_str(&format!(
+            "<Override PartName=\"/ppt/slides/slide{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>",
+            index
+        ));
     }
-    PPTX_SLIDE_XML.replace("{content}", &escape_xml(&body))
+    xml.push_str("</Types>");
+    xml
+}
+
+fn build_slide_xml(slide: &SlideData) -> String {
+    let mut shapes = String::new();
+    shapes.push_str(&pptx_text_shape(
+        2,
+        "Title",
+        548_640,
+        365_760,
+        8_046_720,
+        822_960,
+        &pptx_title_paragraph(&slide.title),
+    ));
+    shapes.push_str(&pptx_text_shape(
+        3,
+        "Content",
+        822_960,
+        1_462_960,
+        7_498_080,
+        2_925_920,
+        &pptx_bullet_paragraphs(&slide.bullets),
+    ));
+    if !slide.notes.is_empty() {
+        shapes.push_str(&pptx_text_shape(
+            4,
+            "Speaker Notes",
+            822_960,
+            4_389_120,
+            7_498_080,
+            548_640,
+            &pptx_notes_paragraph(&slide.notes),
+        ));
+    }
+    PPTX_SLIDE_XML.replace("{shapes}", &shapes)
+}
+
+fn pptx_text_shape(
+    id: u32,
+    name: &str,
+    x: i64,
+    y: i64,
+    cx: i64,
+    cy: i64,
+    paragraphs: &str,
+) -> String {
+    format!(
+        "<p:sp><p:nvSpPr><p:cNvPr id=\"{}\" name=\"{}\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x=\"{}\" y=\"{}\"/><a:ext cx=\"{}\" cy=\"{}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr wrap=\"square\" anchor=\"t\"/><a:lstStyle/>{}</p:txBody></p:sp>",
+        id,
+        escape_xml(name),
+        x,
+        y,
+        cx,
+        cy,
+        paragraphs
+    )
+}
+
+fn pptx_title_paragraph(title: &str) -> String {
+    format!(
+        "<a:p><a:pPr algn=\"l\"/><a:r><a:rPr lang=\"zh-CN\" sz=\"3400\" b=\"1\"><a:solidFill><a:srgbClr val=\"1F2937\"/></a:solidFill><a:latin typeface=\"Aptos Display\"/><a:ea typeface=\"Microsoft YaHei\"/></a:rPr><a:t>{}</a:t></a:r></a:p>",
+        escape_xml(title)
+    )
+}
+
+fn pptx_bullet_paragraphs(bullets: &[String]) -> String {
+    if bullets.is_empty() {
+        return "<a:p><a:r><a:rPr lang=\"zh-CN\" sz=\"2200\"/><a:t></a:t></a:r></a:p>".to_string();
+    }
+    bullets
+        .iter()
+        .map(|bullet| {
+            format!(
+                "<a:p><a:pPr marL=\"342900\" indent=\"-228600\"><a:buChar char=\"•\"/></a:pPr><a:r><a:rPr lang=\"zh-CN\" sz=\"2200\"><a:solidFill><a:srgbClr val=\"374151\"/></a:solidFill><a:latin typeface=\"Aptos\"/><a:ea typeface=\"Microsoft YaHei\"/></a:rPr><a:t>{}</a:t></a:r></a:p>",
+                escape_xml(bullet)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn pptx_notes_paragraph(notes: &str) -> String {
+    format!(
+        "<a:p><a:r><a:rPr lang=\"zh-CN\" sz=\"1400\" i=\"1\"><a:solidFill><a:srgbClr val=\"6B7280\"/></a:solidFill><a:latin typeface=\"Aptos\"/><a:ea typeface=\"Microsoft YaHei\"/></a:rPr><a:t>{}</a:t></a:r></a:p>",
+        escape_xml(notes)
+    )
 }
 
 fn build_sheet_xml(rows: &[Vec<String>]) -> String {
@@ -3878,11 +3972,9 @@ const DOCX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships 
 const DOCX_DOCUMENT_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#;
 const DOCX_DOCUMENT_SUFFIX: &str = r#"<w:sectPr/></w:body></w:document>"#;
 
-const PPTX_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#;
-const PPTX_TEMPLATE_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#;
 const PPTX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#;
 const PPTX_PRESENTATION_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#;
-const PPTX_SLIDE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Content"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{content}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+const PPTX_SLIDE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{shapes}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"#;
 
 const XLSX_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
 const XLSX_TEMPLATE_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
@@ -5020,7 +5112,10 @@ mod tests {
                     "path":"deck.pptx",
                     "format":"ppt",
                     "title":"演示",
-                    "slides":[{"title":"第一页","bullets":["要点"]}]
+                    "slides":[
+                        {"title":"第一页","bullets":["要点"],"speaker_notes":"备注"},
+                        {"title":"第二页","bullets":["更多要点"]}
+                    ]
                 }),
                 &mut ctx,
             )
@@ -5030,6 +5125,25 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         assert!(archive.by_name("ppt/slides/slide1.xml").is_ok());
         assert!(archive.by_name("ppt/slides/slide2.xml").is_ok());
+        assert!(archive.by_name("ppt/slides/slide3.xml").is_ok());
+        let mut content_types = String::new();
+        archive
+            .by_name("[Content_Types].xml")
+            .unwrap()
+            .read_to_string(&mut content_types)
+            .unwrap();
+        assert!(content_types.contains("/ppt/slides/slide1.xml"));
+        assert!(content_types.contains("/ppt/slides/slide2.xml"));
+        assert!(content_types.contains("/ppt/slides/slide3.xml"));
+        let mut slide_xml = String::new();
+        archive
+            .by_name("ppt/slides/slide2.xml")
+            .unwrap()
+            .read_to_string(&mut slide_xml)
+            .unwrap();
+        assert!(slide_xml.contains("第一页"));
+        assert!(slide_xml.contains("要点"));
+        assert!(slide_xml.contains("备注"));
 
         let epub = registry
             .execute(
