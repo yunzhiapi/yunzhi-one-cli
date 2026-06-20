@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEventKind,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::style::Stylize;
@@ -30,6 +30,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
+use unicode_width::UnicodeWidthChar;
 
 static EVENT_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>> = OnceLock::new();
 
@@ -372,7 +373,7 @@ pub async fn run_fullscreen(
                                 return Ok(());
                             }
                         }
-                        Event::Mouse(mouse) => handle_mouse(mouse.kind, &mut app),
+                        Event::Mouse(mouse) => handle_mouse(mouse, &mut app),
                         Event::Paste(text) => app.insert_text_at_cursor(&text),
                         _ => {}
                     }
@@ -505,6 +506,7 @@ struct FullscreenApp {
     status: String,
     busy: bool,
     pending: Option<PendingPrompt>,
+    output_area: Rect,
 }
 
 impl FullscreenApp {
@@ -522,6 +524,7 @@ impl FullscreenApp {
             status: format!("模式 agent | 模型 {DEFAULT_MODEL} | tokens 0 | $0.000000"),
             busy: false,
             pending: None,
+            output_area: Rect::default(),
         }
     }
 
@@ -535,6 +538,7 @@ impl FullscreenApp {
                 Constraint::Length(5),
             ])
             .split(area);
+        self.output_area = chunks[0];
 
         let output_items = self
             .lines
@@ -551,6 +555,10 @@ impl FullscreenApp {
         } else {
             format!("上移 {} 行", self.scroll)
         };
+        let output_title = format!(
+            " 云智 One v{} | 输出 | {} | 滚轮/PageUp/PageDown ",
+            self.version, position
+        );
         let output = List::new(
             output_items
                 .into_iter()
@@ -558,28 +566,28 @@ impl FullscreenApp {
                 .take(visible_end.saturating_sub(visible_start))
                 .collect::<Vec<_>>(),
         )
-        .block(
-            Block::default()
-                .title(format!(
-                    " 云智 One v{} | 输出 | {} ",
-                    self.version, position
-                ))
-                .borders(Borders::ALL),
-        )
-        .style(Style::default().fg(Color::Gray));
+        .block(Block::default().title(output_title).borders(Borders::ALL))
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(Style::default().fg(Color::White));
         frame.render_widget(output, chunks[0]);
 
         let status = Paragraph::new(self.status.clone())
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+            .style(Style::default().bg(Color::Rgb(34, 40, 49)).fg(Color::White));
         frame.render_widget(status, chunks[1]);
 
         let input_title = if self.busy {
-            " 输入 | 运行中 "
+            " 输入 | 运行中 | Enter 发送 Ctrl+J 换行 "
         } else {
-            " 输入 "
+            " 输入 | Enter 发送 Ctrl+J 换行 "
         };
         let input = Paragraph::new(self.input_string())
-            .block(Block::default().title(input_title).borders(Borders::ALL))
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .title(input_title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
             .wrap(Wrap { trim: false });
         frame.render_widget(input, chunks[2]);
         let (cursor_x, cursor_y) = self.cursor_position(chunks[2]);
@@ -606,7 +614,13 @@ impl FullscreenApp {
             let text = Text::from(pending.render_text());
             frame.render_widget(
                 Paragraph::new(text)
-                    .block(Block::default().title(" 需要确认 ").borders(Borders::ALL))
+                    .style(Style::default().fg(Color::White))
+                    .block(
+                        Block::default()
+                            .title(" 需要确认 ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow)),
+                    )
                     .wrap(Wrap { trim: false }),
                 popup,
             );
@@ -845,11 +859,23 @@ impl FullscreenApp {
         let mut y = 0_u16;
         let width = area.width.saturating_sub(2).max(1);
         for ch in before.chars() {
-            if ch == '\n' || x + 1 >= width {
+            if ch == '\n' {
                 x = 0;
                 y = y.saturating_add(1);
             } else {
-                x = x.saturating_add(1);
+                let char_width = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if char_width == 0 {
+                    continue;
+                }
+                if x.saturating_add(char_width) > width {
+                    x = 0;
+                    y = y.saturating_add(1);
+                }
+                x = x.saturating_add(char_width);
+                if x >= width {
+                    x = 0;
+                    y = y.saturating_add(1);
+                }
             }
         }
         (
@@ -942,12 +968,22 @@ fn handle_key(
     Ok(false)
 }
 
-fn handle_mouse(kind: MouseEventKind, app: &mut FullscreenApp) {
-    match kind {
+fn handle_mouse(mouse: MouseEvent, app: &mut FullscreenApp) {
+    if !contains_point(app.output_area, mouse.column, mouse.row) {
+        return;
+    }
+    match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll_up(3),
         MouseEventKind::ScrollDown => app.scroll_down(3),
         _ => {}
     }
+}
+
+fn contains_point(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 #[derive(Clone)]
@@ -1340,5 +1376,31 @@ mod tests {
 
         assert_eq!(app.input_string(), "hello\n粘贴\n world");
         assert_eq!(app.cursor, "hello\n粘贴\n".chars().count());
+    }
+
+    #[test]
+    fn cursor_position_uses_display_width() {
+        let mut app = FullscreenApp::new("test");
+        app.insert_text_at_cursor("abc中文");
+
+        assert_eq!(app.cursor_position(Rect::new(0, 0, 20, 5)), (8, 1));
+    }
+
+    #[test]
+    fn cursor_position_wraps_wide_characters() {
+        let mut app = FullscreenApp::new("test");
+        app.insert_text_at_cursor("abcd中");
+
+        assert_eq!(app.cursor_position(Rect::new(0, 0, 7, 5)), (3, 2));
+    }
+
+    #[test]
+    fn contains_point_respects_area_edges() {
+        let area = Rect::new(2, 3, 10, 4);
+
+        assert!(contains_point(area, 2, 3));
+        assert!(contains_point(area, 11, 6));
+        assert!(!contains_point(area, 12, 6));
+        assert!(!contains_point(area, 11, 7));
     }
 }
