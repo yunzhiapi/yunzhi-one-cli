@@ -3,6 +3,7 @@ use crate::types::{ToolDefinition, ToolOutput};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use glob::glob;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
@@ -39,6 +40,8 @@ pub struct ToolContext {
     pub dangerously_skip_permissions: bool,
     pub allow_all: bool,
     pub prompter: Arc<dyn PermissionPrompter>,
+    todos: Vec<TodoItem>,
+    next_todo_id: u64,
 }
 
 impl ToolContext {
@@ -54,6 +57,8 @@ impl ToolContext {
             dangerously_skip_permissions,
             allow_all: false,
             prompter,
+            todos: Vec::new(),
+            next_todo_id: 1,
         }
     }
 
@@ -70,6 +75,23 @@ impl ToolContext {
             PermissionDecision::Deny => anyhow::bail!("用户拒绝执行该工具"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: u64,
+    pub title: String,
+    pub status: TodoStatus,
+    pub notes: Option<String>,
 }
 
 #[async_trait]
@@ -105,6 +127,10 @@ impl ToolRegistry {
         registry.register(GrepSearchTool);
         registry.register(ListDirTool);
         registry.register(CallModelTool);
+        registry.register(ExecuteCodeTool);
+        registry.register(RunProgramTool);
+        registry.register(ManageTodosTool);
+        registry.register(SystemControlTool);
         registry
     }
 
@@ -489,6 +515,320 @@ impl Tool for CallModelTool {
     }
 }
 
+struct ExecuteCodeTool;
+
+#[async_trait]
+impl Tool for ExecuteCodeTool {
+    fn name(&self) -> &'static str {
+        "execute_code"
+    }
+    fn description(&self) -> &'static str {
+        "执行短代码片段并返回输出，支持 python、node、bash、rust-script 风格入口"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "language":{"type":"string","enum":["python","javascript","node","bash","sh","rust"],"description":"代码语言"},
+                "code":{"type":"string","description":"要执行的代码片段"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+            },
+            "required":["language","code"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let language = string_arg(&args, "language")?.to_lowercase();
+        let code = string_arg(&args, "code")?;
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        let command = match language.as_str() {
+            "python" => vec!["python3".to_string(), "-c".to_string(), code.clone()],
+            "javascript" | "node" => vec!["node".to_string(), "-e".to_string(), code.clone()],
+            "bash" | "sh" => vec!["sh".to_string(), "-c".to_string(), code.clone()],
+            "rust" => vec!["rust-script".to_string(), "-e".to_string(), code.clone()],
+            _ => anyhow::bail!("不支持的语言: {language}"),
+        };
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("执行 {} 代码片段", language),
+                diff: None,
+            })
+            .await?;
+        run_command(command, &context.cwd, timeout_secs).await
+    }
+}
+
+struct RunProgramTool;
+
+#[async_trait]
+impl Tool for RunProgramTool {
+    fn name(&self) -> &'static str {
+        "run_program"
+    }
+    fn description(&self) -> &'static str {
+        "运行工作目录内或 PATH 中的程序，参数以数组传入，执行前请求确认"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "program":{"type":"string","description":"程序路径或 PATH 中的可执行文件名"},
+                "args":{"type":"array","items":{"type":"string"},"description":"程序参数"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+            },
+            "required":["program"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let program = string_arg(&args, "program")?;
+        let mut command = vec![program.clone()];
+        if let Some(values) = args.get("args").and_then(Value::as_array) {
+            for value in values {
+                command.push(
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow!("args 必须全部是字符串"))?
+                        .to_string(),
+                );
+            }
+        }
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!(
+                    "运行程序: {}",
+                    shell_words::join(command.iter().map(String::as_str))
+                ),
+                diff: None,
+            })
+            .await?;
+        run_command(command, &context.cwd, timeout_secs).await
+    }
+}
+
+struct ManageTodosTool;
+
+#[async_trait]
+impl Tool for ManageTodosTool {
+    fn name(&self) -> &'static str {
+        "manage_todos"
+    }
+    fn description(&self) -> &'static str {
+        "管理和跟踪当前会话内的代办任务，支持 add、update、list、clear"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["add","update","list","clear"]},
+                "id":{"type":"integer","description":"update 时需要的任务 id"},
+                "title":{"type":"string","description":"add/update 的任务标题"},
+                "status":{"type":"string","enum":["pending","in_progress","done","blocked"],"description":"任务状态"},
+                "notes":{"type":"string","description":"任务备注"}
+            },
+            "required":["action"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        match string_arg(&args, "action")?.as_str() {
+            "add" => {
+                let title = string_arg(&args, "title")?;
+                let status = parse_todo_status(
+                    args.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pending"),
+                )?;
+                let item = TodoItem {
+                    id: context.next_todo_id,
+                    title,
+                    status,
+                    notes: args
+                        .get("notes")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                };
+                context.next_todo_id += 1;
+                context.todos.push(item);
+                Ok(ToolOutput::ok(render_todos(&context.todos)))
+            }
+            "update" => {
+                let id = args
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("update 需要 id"))?;
+                let item = context
+                    .todos
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                    .ok_or_else(|| anyhow!("未找到代办任务: {id}"))?;
+                if let Some(title) = args.get("title").and_then(Value::as_str) {
+                    item.title = title.to_string();
+                }
+                if let Some(status) = args.get("status").and_then(Value::as_str) {
+                    item.status = parse_todo_status(status)?;
+                }
+                if args.get("notes").is_some() {
+                    item.notes = args
+                        .get("notes")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                }
+                Ok(ToolOutput::ok(render_todos(&context.todos)))
+            }
+            "list" => Ok(ToolOutput::ok(render_todos(&context.todos))),
+            "clear" => {
+                context.todos.clear();
+                context.next_todo_id = 1;
+                Ok(ToolOutput::ok("已清空代办任务"))
+            }
+            action => anyhow::bail!("不支持的代办操作: {action}"),
+        }
+    }
+}
+
+struct SystemControlTool;
+
+#[async_trait]
+impl Tool for SystemControlTool {
+    fn name(&self) -> &'static str {
+        "system_control"
+    }
+    fn description(&self) -> &'static str {
+        "执行受控系统操作：查看环境、当前目录、进程列表、磁盘信息、终止进程"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["pwd","env","processes","disk","kill_process"]},
+                "pid":{"type":"integer","description":"kill_process 的进程 id"},
+                "signal":{"type":"string","description":"kill_process 的信号，默认 TERM"}
+            },
+            "required":["action"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        match string_arg(&args, "action")?.as_str() {
+            "pwd" => Ok(ToolOutput::ok(context.cwd.display().to_string())),
+            "env" => {
+                let mut vars = std::env::vars()
+                    .filter(|(key, _)| {
+                        !key.to_lowercase().contains("key")
+                            && !key.to_lowercase().contains("token")
+                            && !key.to_lowercase().contains("secret")
+                    })
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>();
+                vars.sort();
+                Ok(ToolOutput::ok(vars.join("\n")))
+            }
+            "processes" => {
+                run_command(
+                    vec![
+                        "ps".to_string(),
+                        "-eo".to_string(),
+                        "pid,ppid,comm,args".to_string(),
+                    ],
+                    &context.cwd,
+                    10,
+                )
+                .await
+            }
+            "disk" => {
+                run_command(
+                    vec!["df".to_string(), "-h".to_string(), ".".to_string()],
+                    &context.cwd,
+                    10,
+                )
+                .await
+            }
+            "kill_process" => {
+                let pid = args
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("kill_process 需要 pid"))?;
+                let signal = args.get("signal").and_then(Value::as_str).unwrap_or("TERM");
+                context
+                    .confirm(PermissionRequest {
+                        tool_name: self.name().to_string(),
+                        summary: format!("发送 SIG{} 到进程 {}", signal, pid),
+                        diff: None,
+                    })
+                    .await?;
+                run_command(
+                    vec!["kill".to_string(), format!("-{}", signal), pid.to_string()],
+                    &context.cwd,
+                    10,
+                )
+                .await
+            }
+            action => anyhow::bail!("不支持的系统操作: {action}"),
+        }
+    }
+}
+
+async fn run_command(command: Vec<String>, cwd: &Path, timeout_secs: u64) -> Result<ToolOutput> {
+    anyhow::ensure!(!command.is_empty(), "命令不能为空");
+    let started = Instant::now();
+    let mut process = Command::new(&command[0]);
+    process.args(&command[1..]).current_dir(cwd);
+    let output = timeout(Duration::from_secs(timeout_secs), process.output())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "命令超时，已终止: {}",
+                shell_words::join(command.iter().map(String::as_str))
+            )
+        })??;
+    let elapsed = started.elapsed().as_secs_f32();
+    let mut rendered = format!(
+        "command: {}\nexit: {} ({elapsed:.1}s)\n",
+        shell_words::join(command.iter().map(String::as_str)),
+        output.status
+    );
+    if !output.stdout.is_empty() {
+        rendered.push_str("stdout:\n");
+        rendered.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        rendered.push_str("\nstderr:\n");
+        rendered.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(ToolOutput {
+        content: rendered,
+        is_error: !output.status.success(),
+    })
+}
+
+fn parse_todo_status(raw: &str) -> Result<TodoStatus> {
+    match raw {
+        "pending" => Ok(TodoStatus::Pending),
+        "in_progress" => Ok(TodoStatus::InProgress),
+        "done" => Ok(TodoStatus::Done),
+        "blocked" => Ok(TodoStatus::Blocked),
+        status => anyhow::bail!("不支持的任务状态: {status}"),
+    }
+}
+
+fn render_todos(todos: &[TodoItem]) -> String {
+    if todos.is_empty() {
+        return "暂无代办任务".to_string();
+    }
+    todos
+        .iter()
+        .map(|item| {
+            let notes = item.notes.as_deref().unwrap_or("");
+            if notes.is_empty() {
+                format!("{} [{:?}] {}", item.id, item.status, item.title)
+            } else {
+                format!("{} [{:?}] {} - {}", item.id, item.status, item.title, notes)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub struct AlwaysAllowPrompter;
 
 #[async_trait]
@@ -558,5 +898,56 @@ mod tests {
             )
             .await;
         assert!(output.is_error);
+    }
+
+    #[tokio::test]
+    async fn manages_todos() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "manage_todos",
+                json!({"action":"add","title":"实现工具","status":"in_progress"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(output.content.contains("实现工具"));
+        assert!(output.content.contains("InProgress"));
+        let output = registry
+            .execute(
+                "manage_todos",
+                json!({"action":"update","id":1,"status":"done"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(output.content.contains("Done"));
+    }
+
+    #[tokio::test]
+    async fn executes_code() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "execute_code",
+                json!({"language":"bash","code":"printf yunzhi"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("yunzhi"));
+    }
+
+    #[tokio::test]
+    async fn system_control_reports_pwd() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute("system_control", json!({"action":"pwd"}), &mut ctx)
+            .await;
+        assert_eq!(output.content, dir.path().display().to_string());
     }
 }
