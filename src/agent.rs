@@ -1,5 +1,5 @@
 use crate::config::load_project_memory;
-use crate::llm::{ChatRequest, LlmClient};
+use crate::llm::{ChatRequest, LlmClient, ToolChoice};
 use crate::tools::{PermissionPrompter, PermissionRequest, ToolContext, ToolRegistry};
 use crate::tui;
 use crate::types::{AgentMode, AgentOptions, ContentBlock, Message, Role, StreamEvent};
@@ -70,6 +70,7 @@ impl<C: LlmClient> Agent<C> {
     }
 
     pub async fn run_turn(&mut self, input: String) -> Result<String> {
+        let tool_choice = tool_choice_for_input(self.options.mode, &input);
         self.history.push(Message::user(input));
         self.compress_if_needed();
         let started = Instant::now();
@@ -83,6 +84,7 @@ impl<C: LlmClient> Agent<C> {
                 system: Some(self.system_prompt.clone()),
                 messages: self.history.clone(),
                 tools: self.tools.definitions(),
+                tool_choice: tool_choice.clone(),
             };
 
             let mut stream = self.client.stream_messages(request).await?;
@@ -211,12 +213,70 @@ fn looks_like_unverified_completion(text: &str) -> bool {
         .any(|word| text.contains(word) || ascii.contains(word))
 }
 
+fn tool_choice_for_input(mode: AgentMode, input: &str) -> ToolChoice {
+    if matches!(mode, AgentMode::Chat | AgentMode::Analyze) {
+        return ToolChoice::Auto;
+    }
+    if mentions_file_write(input) {
+        return ToolChoice::Function("write_file".to_string());
+    }
+    if mentions_file_read(input) {
+        return ToolChoice::Function("read_file".to_string());
+    }
+    if mentions_command_run(input) {
+        return ToolChoice::Required;
+    }
+    ToolChoice::Auto
+}
+
+fn mentions_file_write(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    let write_words = [
+        "新建", "创建", "写入", "保存", "生成", "修改", "编辑", "create", "write", "save",
+        "modify", "edit",
+    ];
+    let file_words = [
+        "文件", "file", ".txt", ".md", ".rs", ".json", ".toml", ".yaml", ".yml",
+    ];
+    write_words
+        .iter()
+        .any(|word| input.contains(word) || lower.contains(word))
+        && file_words
+            .iter()
+            .any(|word| input.contains(word) || lower.contains(word))
+}
+
+fn mentions_file_read(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    let read_words = [
+        "读取", "查看", "打开", "看看", "read", "show", "cat", "open",
+    ];
+    let file_words = [
+        "文件", "file", ".txt", ".md", ".rs", ".json", ".toml", ".yaml", ".yml",
+    ];
+    read_words
+        .iter()
+        .any(|word| input.contains(word) || lower.contains(word))
+        && file_words
+            .iter()
+            .any(|word| input.contains(word) || lower.contains(word))
+}
+
+fn mentions_command_run(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    [
+        "运行", "执行", "run", "execute", "cargo ", "npm ", "python", "node ",
+    ]
+    .iter()
+    .any(|word| input.contains(word) || lower.contains(word))
+}
+
 fn mode_prompt(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Chat => "chat 模式：以解释、问答和轻量建议为主。除非用户明确要求修改或运行，否则优先不调用会改变环境的工具。",
         AgentMode::PlanAct => "plan&act 模式：先给出短计划，确认目标和风险后分步执行；执行过程中持续更新计划并验证结果。",
         AgentMode::Entanglement => "entanglement 模式：把用户、代码、工具和其他模型视为协同上下文；主动交叉检查关键判断，在复杂任务中用 call_model 分离子问题。",
-        AgentMode::Agent => "agent 模式：默认自主完成软件开发任务；在需求清楚时直接读取、编辑、测试和总结，遇到高风险操作再请求确认。",
+        AgentMode::Agent => "agent 模式：默认自主完成软件开发任务；在需求清楚时必须直接调用工具读取、编辑、测试和总结，不要用对话确认替代工具操作，遇到高风险操作由工具权限确认接管。",
         AgentMode::Team => "team 模式：模拟小团队协作，把任务拆成架构、实现、测试、审查等角色视角；必要时委派其他模型处理子任务并汇总决策。",
         AgentMode::Analyze => "analyze 模式：以只读分析、定位问题、风险评估和方案比较为主；除非用户明确授权，避免修改文件或执行破坏性操作。",
     }
@@ -250,5 +310,21 @@ mod tests {
     fn token_estimate_rounds_up() {
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn agent_mode_forces_file_write_tool() {
+        assert_eq!(
+            tool_choice_for_input(AgentMode::Agent, "新建一个txt文件，里面写上test"),
+            ToolChoice::Function("write_file".to_string())
+        );
+    }
+
+    #[test]
+    fn chat_mode_keeps_tools_auto() {
+        assert_eq!(
+            tool_choice_for_input(AgentMode::Chat, "新建一个txt文件，里面写上test"),
+            ToolChoice::Auto
+        );
     }
 }

@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -89,6 +89,27 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    Function(String),
+}
+
+impl ToolChoice {
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Auto => json!("auto"),
+            Self::Required => json!("required"),
+            Self::Function(name) => json!({
+                "type": "function",
+                "function": { "name": name }
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -100,7 +121,7 @@ struct ChatCompletionsRequest<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
+    tool_choice: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,7 +244,7 @@ impl ChatCompletionsClient {
             stream: true,
             messages: to_chat_messages(request.system.as_deref(), &request.messages),
             tools: request.tools.iter().map(to_chat_tool).collect(),
-            tool_choice: (!request.tools.is_empty()).then_some("auto"),
+            tool_choice: (!request.tools.is_empty()).then(|| request.tool_choice.to_value()),
         };
         self.send_json(body).await
     }
@@ -491,9 +512,16 @@ mod tests {
                     parameters: json!({"type":"object"}),
                 },
             }],
-            tool_choice: Some("auto"),
+            tool_choice: Some(ToolChoice::Auto.to_value()),
         };
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn serializes_forced_function_tool_choice() {
+        let value = ToolChoice::Function("write_file".to_string()).to_value();
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["function"]["name"], "write_file");
     }
 }
