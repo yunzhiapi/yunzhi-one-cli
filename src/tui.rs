@@ -1,3 +1,4 @@
+use crate::observability::{TurnMetrics, UsageMetrics};
 use crate::tools::{
     PermissionDecision, PermissionPrompter, PermissionRequest, UserChoiceRequest,
     UserChoiceResponse, UserQuestionRequest,
@@ -48,12 +49,19 @@ pub fn print_agent_delta(text: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn print_agent_done(elapsed_secs: f32, estimated_tokens: usize) {
+pub fn print_agent_done(turn: TurnMetrics, session: UsageMetrics, context_tokens: usize) {
     println!(
-        "\n{} 耗时 {:.1}s | 估算 tokens {}\n",
+        "\n{} 本轮 {:.1}s | req {} | tokens {} | ${:.6} | 会话 {:.1}s | req {} | tokens {} | ${:.6} | 上下文 {}\n",
         "状态".dark_grey(),
-        elapsed_secs,
-        estimated_tokens
+        turn.elapsed_ms as f32 / 1000.0,
+        turn.request_count,
+        turn.total_tokens(),
+        turn.estimated_cost_usd,
+        session.elapsed_ms as f32 / 1000.0,
+        session.request_count,
+        session.total_tokens(),
+        session.estimated_cost_usd,
+        context_tokens
     );
 }
 

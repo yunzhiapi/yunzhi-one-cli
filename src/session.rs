@@ -1,3 +1,4 @@
+use crate::observability::UsageMetrics;
 use crate::types::Message;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,8 @@ pub struct SavedSession {
     pub created_unix: u64,
     pub updated_unix: u64,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub usage: UsageMetrics,
     #[serde(default)]
     pub checkpoints: Vec<SessionCheckpoint>,
 }
@@ -110,6 +113,7 @@ pub fn new_session(id: String, messages: Vec<Message>) -> SavedSession {
         created_unix: now,
         updated_unix: now,
         messages,
+        usage: UsageMetrics::default(),
         checkpoints: Vec::new(),
     }
 }

@@ -2,6 +2,11 @@ use crate::config::load_project_memory;
 use crate::extensions::render_skills_index;
 use crate::hooks::{format_hook_runs, run_matching_hooks, HookEvent};
 use crate::llm::{ChatRequest, LlmClient, ToolChoice};
+use crate::observability::{
+    append_tool_audit, estimate_cost_usd, estimate_request_tokens,
+    estimate_tokens as estimate_text_tokens, now_unix, truncate_preview, ToolAuditRecord,
+    TurnMetrics, UsageMetrics,
+};
 use crate::session::{
     create_checkpoint, list_sessions, load_session, new_session, rollback_checkpoint, save_session,
 };
@@ -53,6 +58,7 @@ pub struct Agent<C: LlmClient> {
     context: ToolContext,
     options: AgentOptions,
     pending_plan: Option<String>,
+    usage: UsageMetrics,
 }
 
 impl<C: LlmClient> Agent<C> {
@@ -82,6 +88,7 @@ impl<C: LlmClient> Agent<C> {
             ),
             options,
             pending_plan: None,
+            usage: UsageMetrics::default(),
         })
     }
 
@@ -104,20 +111,21 @@ impl<C: LlmClient> Agent<C> {
     pub fn clear(&mut self) -> Result<()> {
         self.history.clear();
         self.pending_plan = None;
+        self.usage = UsageMetrics::default();
         self.refresh_system_prompt()?;
         Ok(())
     }
 
     pub fn save_session(&self, id: &str) -> Result<PathBuf> {
-        save_session(
-            &self.context.cwd,
-            &new_session(id.to_string(), self.history.clone()),
-        )
+        let mut session = new_session(id.to_string(), self.history.clone());
+        session.usage = self.usage;
+        save_session(&self.context.cwd, &session)
     }
 
     pub fn resume_session(&mut self, id: &str) -> Result<()> {
         let session = load_session(&self.context.cwd, id)?;
         self.history = session.messages;
+        self.usage = session.usage;
         self.pending_plan = None;
         self.refresh_system_prompt()?;
         Ok(())
@@ -144,9 +152,14 @@ impl<C: LlmClient> Agent<C> {
         let mut session = match load_session(&self.context.cwd, id) {
             Ok(mut session) => {
                 session.messages = self.history.clone();
+                session.usage = self.usage;
                 session
             }
-            Err(_) => new_session(id.to_string(), self.history.clone()),
+            Err(_) => {
+                let mut session = new_session(id.to_string(), self.history.clone());
+                session.usage = self.usage;
+                session
+            }
         };
         create_checkpoint(&self.context.cwd, &mut session, note)
     }
@@ -155,6 +168,7 @@ impl<C: LlmClient> Agent<C> {
         let session = load_session(&self.context.cwd, id)?;
         rollback_checkpoint(&self.context.cwd, &session, checkpoint_id)?;
         self.history = session.messages;
+        self.usage = session.usage;
         self.pending_plan = None;
         self.refresh_system_prompt()?;
         Ok(())
@@ -186,6 +200,7 @@ impl<C: LlmClient> Agent<C> {
         let started = Instant::now();
         let mut final_text = String::new();
         let mut tool_call_count = 0;
+        let mut turn_metrics = TurnMetrics::default();
 
         loop {
             let request = ChatRequest {
@@ -202,6 +217,9 @@ impl<C: LlmClient> Agent<C> {
                 },
                 tool_choice: tool_choice.clone(),
             };
+            turn_metrics.request_count += 1;
+            turn_metrics.input_tokens +=
+                estimate_request_tokens(request.system.as_deref(), &request.messages);
 
             let mut stream = self.client.stream_messages(request).await?;
             let mut assistant_blocks = Vec::new();
@@ -212,6 +230,7 @@ impl<C: LlmClient> Agent<C> {
                 match event? {
                     StreamEvent::TextDelta(delta) => {
                         tui::print_agent_delta(&delta)?;
+                        turn_metrics.output_tokens += estimate_text_tokens(&delta);
                         text_accumulator.push_str(&delta);
                         final_text.push_str(&delta);
                     }
@@ -248,7 +267,15 @@ impl<C: LlmClient> Agent<C> {
                 if tool_call_count == 0 && looks_like_unverified_completion(&final_text) {
                     tui::print_unverified_completion_warning();
                 }
-                tui::print_agent_done(started.elapsed().as_secs_f32(), self.estimated_tokens());
+                turn_metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+                turn_metrics.tool_call_count = tool_call_count;
+                turn_metrics.estimated_cost_usd = estimate_cost_usd(
+                    &self.options.model,
+                    turn_metrics.input_tokens,
+                    turn_metrics.output_tokens,
+                );
+                self.usage.add_turn(turn_metrics);
+                tui::print_agent_done(turn_metrics, self.usage, self.estimated_tokens());
                 return Ok(final_text);
             }
 
@@ -299,6 +326,18 @@ impl<C: LlmClient> Agent<C> {
                     }
                 };
                 tui::print_tool_done(!output.is_error, tool_started.elapsed().as_secs_f32());
+                let audit_record = ToolAuditRecord {
+                    timestamp_unix: now_unix(),
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    input: call.input.clone(),
+                    output_preview: truncate_preview(&output.content, 4000),
+                    is_error: output.is_error,
+                    elapsed_ms: tool_started.elapsed().as_millis() as u64,
+                };
+                if let Err(error) = append_tool_audit(&self.context.cwd, &audit_record) {
+                    eprintln!("审计日志写入失败: {error:#}");
+                }
                 self.history.push(Message::tool_result(
                     call.id,
                     output.content,

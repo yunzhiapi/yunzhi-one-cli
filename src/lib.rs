@@ -4,6 +4,7 @@ pub mod config;
 pub mod extensions;
 pub mod hooks;
 pub mod llm;
+pub mod observability;
 pub mod session;
 pub mod tools;
 pub mod tui;
