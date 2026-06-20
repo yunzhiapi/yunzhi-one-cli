@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -133,6 +134,7 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "generate_image"
             | "write_document"
             | "write_table"
+            | "office_document"
             | "ui_design"
             | "long_memory"
     )
@@ -209,6 +211,7 @@ impl ToolRegistry {
         registry.register(GenerateImageTool);
         registry.register(WriteDocumentTool);
         registry.register(WriteTableTool);
+        registry.register(OfficeDocumentTool);
         registry.register(DiskManagerTool);
         registry.register(ComputerManagerTool);
         registry.register(WebSearchTool);
@@ -349,6 +352,34 @@ async fn write_text_file_with_confirmation(
             tool_name: tool_name.to_string(),
             summary,
             diff: Some(diff_text(&old, &content)),
+        })
+        .await?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, content)
+        .await
+        .with_context(|| format!("写入文件失败: {}", path.display()))?;
+    Ok(ToolOutput::ok(format!("已写入 {}", path.display())))
+}
+
+async fn write_binary_file_with_confirmation(
+    tool_name: &str,
+    path: &Path,
+    content: Vec<u8>,
+    context: &mut ToolContext,
+    summary: String,
+) -> Result<ToolOutput> {
+    let old = fs::read(path).await.unwrap_or_default();
+    context
+        .confirm(PermissionRequest {
+            tool_name: tool_name.to_string(),
+            summary,
+            diff: Some(format!(
+                "binary file: {} bytes -> {} bytes",
+                old.len(),
+                content.len()
+            )),
         })
         .await?;
     if let Some(parent) = path.parent() {
@@ -1405,17 +1436,18 @@ impl Tool for CreatePresentationTool {
         "create_presentation"
     }
     fn description(&self) -> &'static str {
-        "生成 PPT 大纲或可被 Marp/Markdown 转换为 PPT 的演示文稿文件"
+        "生成 PPT 大纲、Marp Markdown 或 PPTX/POTX 演示文稿文件"
     }
     fn schema(&self) -> Value {
         json!({
             "type":"object",
             "properties":{
-                "path":{"type":"string","description":"输出文件路径，建议 .md"},
+                "path":{"type":"string","description":"输出文件路径，支持 .md/.pptx/.potx"},
                 "title":{"type":"string","description":"演示文稿标题"},
                 "audience":{"type":"string","description":"目标受众"},
                 "slides":{"type":"array","items":{"type":"object"},"description":"幻灯片数组，每项可含 title、bullets、speaker_notes、image_prompt"},
-                "theme":{"type":"string","description":"可选，视觉主题"}
+                "theme":{"type":"string","description":"可选，视觉主题"},
+                "format":{"type":"string","enum":["markdown","ppt","pptx","potx"]}
             },
             "required":["path","title","slides"]
         })
@@ -1431,6 +1463,20 @@ impl Tool for CreatePresentationTool {
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("slides 必须是数组"))?;
         anyhow::ensure!(!slides.is_empty(), "slides 不能为空");
+        let format = normalize_format(&args, &path, "markdown");
+
+        if matches!(format.as_str(), "ppt" | "pptx" | "potx") {
+            let presentation = collect_presentation(&title, &audience, slides);
+            let content = build_pptx(&presentation, format == "potx")?;
+            return write_binary_file_with_confirmation(
+                self.name(),
+                &path,
+                content,
+                context,
+                format!("生成演示文稿 {}", path.display()),
+            )
+            .await;
+        }
 
         let mut content = format!(
             "---\nmarp: true\ntheme: {}\npaginate: true\n---\n\n# {}\n\n目标受众：{}\n",
@@ -1536,10 +1582,10 @@ impl Tool for WriteDocumentTool {
         "write_document"
     }
     fn description(&self) -> &'static str {
-        "按主题、结构和内容写 Markdown/文本/HTML 文档"
+        "按主题、结构和内容写 Markdown/文本/HTML/Word/PDF/ODT/RTF/EPUB 文档"
     }
     fn schema(&self) -> Value {
-        json!({"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string"},"sections":{"type":"array","items":{"type":"object"}},"format":{"type":"string","enum":["markdown","text","html"]}},"required":["path","title","sections"]})
+        json!({"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string"},"sections":{"type":"array","items":{"type":"object"}},"format":{"type":"string","enum":["markdown","text","html","word","docx","dotx","odt","rtf","pdf","epub"]}},"required":["path","title","sections"]})
     }
     async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
         let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
@@ -1549,6 +1595,20 @@ impl Tool for WriteDocumentTool {
             .get("sections")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("sections 必须是数组"))?;
+        let document = collect_document(&title, sections);
+        if matches!(
+            format.as_str(),
+            "word" | "docx" | "dotx" | "odt" | "rtf" | "pdf" | "epub"
+        ) {
+            return write_office_document(
+                self.name(),
+                &path,
+                &format,
+                OfficeContent::Document(document),
+                context,
+            )
+            .await;
+        }
         let mut content = match format.as_str() {
             "html" => format!("<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{}</title></head><body>\n<h1>{}</h1>\n", title, title),
             "text" => format!("{}\n{}\n\n", title, "=".repeat(title.chars().count())),
@@ -1596,10 +1656,10 @@ impl Tool for WriteTableTool {
         "write_table"
     }
     fn description(&self) -> &'static str {
-        "生成 Markdown 或 CSV 表格文件"
+        "生成 Markdown、CSV、TSV、Excel XLSX/XLTX/XLS 或 LibreOffice Calc ODS 表格文件"
     }
     fn schema(&self) -> Value {
-        json!({"type":"object","properties":{"path":{"type":"string"},"columns":{"type":"array","items":{"type":"string"}},"rows":{"type":"array","items":{"type":"array"}},"format":{"type":"string","enum":["markdown","csv"]}},"required":["path","columns","rows"]})
+        json!({"type":"object","properties":{"path":{"type":"string"},"columns":{"type":"array","items":{"type":"string"}},"rows":{"type":"array","items":{"type":"array"}},"format":{"type":"string","enum":["markdown","csv","tsv","excel","xlsx","xls","xltx","ods","calc"]}},"required":["path","columns","rows"]})
     }
     async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
         let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
@@ -1610,6 +1670,33 @@ impl Tool for WriteTableTool {
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("rows 必须是数组"))?;
         let format = optional_string_arg(&args, "format").unwrap_or_else(|| "markdown".to_string());
+        let table_rows = collect_table_rows(&columns, rows)?;
+        if matches!(format.as_str(), "ods" | "calc" | "excel" | "xlsx" | "xltx") {
+            return write_office_document(
+                self.name(),
+                &path,
+                &format,
+                OfficeContent::Table(table_rows),
+                context,
+            )
+            .await;
+        }
+        if matches!(format.as_str(), "tsv" | "xls") {
+            let content = table_rows
+                .iter()
+                .map(|row| tsv_line(row))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            return write_text_file_with_confirmation(
+                self.name(),
+                &path,
+                content,
+                context,
+                format!("写表格 {}", path.display()),
+            )
+            .await;
+        }
         let mut content = String::new();
         if format == "csv" {
             content.push_str(&csv_line(&columns));
@@ -1652,6 +1739,89 @@ impl Tool for WriteTableTool {
             format!("写表格 {}", path.display()),
         )
         .await
+    }
+}
+
+struct OfficeDocumentTool;
+
+#[async_trait]
+impl Tool for OfficeDocumentTool {
+    fn name(&self) -> &'static str {
+        "office_document"
+    }
+
+    fn description(&self) -> &'static str {
+        "生成 Word/PPT/Excel/PDF/ODT/RTF/DOCX/XLSX/PPTX/EPUB 等办公文档"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "format":{"type":"string","enum":["word","ppt","excel","pdf","odt","rtf","xlsx","ods","tsv","csv","xls","xltx","dotx","docx","potx","pptx","epub"]},
+                "title":{"type":"string"},
+                "sections":{"type":"array","items":{"type":"object"},"description":"文档/电子书章节，含 heading/body"},
+                "slides":{"type":"array","items":{"type":"object"},"description":"演示文稿页面，含 title/bullets/speaker_notes"},
+                "columns":{"type":"array","items":{"type":"string"}},
+                "rows":{"type":"array","items":{"type":"array"}}
+            },
+            "required":["path","format"]
+        })
+    }
+
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let format = normalize_format(&args, &path, "docx");
+        let title = optional_string_arg(&args, "title").unwrap_or_else(|| "未命名文档".to_string());
+
+        match office_kind(&format)? {
+            OfficeKind::Document => {
+                let sections = args
+                    .get("sections")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| vec![json!({"heading":"正文","body":""})]);
+                write_office_document(
+                    self.name(),
+                    &path,
+                    &format,
+                    OfficeContent::Document(collect_document(&title, &sections)),
+                    context,
+                )
+                .await
+            }
+            OfficeKind::Presentation => {
+                let slides = args
+                    .get("slides")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("生成演示文稿需要 slides"))?;
+                let presentation = collect_presentation(&title, "通用受众", slides);
+                write_office_document(
+                    self.name(),
+                    &path,
+                    &format,
+                    OfficeContent::Presentation(presentation),
+                    context,
+                )
+                .await
+            }
+            OfficeKind::Table => {
+                let columns = array_of_strings_arg(&args, "columns")?;
+                let rows = args
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("生成表格需要 rows"))?;
+                write_office_document(
+                    self.name(),
+                    &path,
+                    &format,
+                    OfficeContent::Table(collect_table_rows(&columns, rows)?),
+                    context,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -2214,6 +2384,699 @@ fn value_to_cell(value: &Value) -> String {
         .replace('\n', " ")
 }
 
+fn collect_table_rows(columns: &[String], rows: &[Value]) -> Result<Vec<Vec<String>>> {
+    let mut table_rows = Vec::with_capacity(rows.len() + 1);
+    table_rows.push(columns.to_vec());
+    for row in rows {
+        table_rows.push(
+            row.as_array()
+                .ok_or_else(|| anyhow!("rows 必须是二维数组"))?
+                .iter()
+                .map(value_to_cell)
+                .collect(),
+        );
+    }
+    Ok(table_rows)
+}
+
+#[derive(Clone)]
+struct DocumentData {
+    title: String,
+    sections: Vec<DocumentSection>,
+}
+
+#[derive(Clone)]
+struct DocumentSection {
+    heading: String,
+    body: String,
+}
+
+#[derive(Clone)]
+struct PresentationData {
+    title: String,
+    audience: String,
+    slides: Vec<SlideData>,
+}
+
+#[derive(Clone)]
+struct SlideData {
+    title: String,
+    bullets: Vec<String>,
+    notes: String,
+}
+
+enum OfficeContent {
+    Document(DocumentData),
+    Presentation(PresentationData),
+    Table(Vec<Vec<String>>),
+}
+
+enum OfficeKind {
+    Document,
+    Presentation,
+    Table,
+}
+
+fn normalize_format(args: &Value, path: &Path, default: &str) -> String {
+    optional_string_arg(args, "format")
+        .or_else(|| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| default.to_string())
+        .to_ascii_lowercase()
+}
+
+fn office_kind(format: &str) -> Result<OfficeKind> {
+    match format {
+        "word" | "docx" | "dotx" | "odt" | "rtf" | "pdf" | "epub" => Ok(OfficeKind::Document),
+        "ppt" | "pptx" | "potx" => Ok(OfficeKind::Presentation),
+        "excel" | "xlsx" | "xltx" | "ods" | "calc" | "tsv" | "csv" | "xls" => Ok(OfficeKind::Table),
+        other => anyhow::bail!("不支持的办公格式: {other}"),
+    }
+}
+
+fn collect_document(title: &str, sections: &[Value]) -> DocumentData {
+    DocumentData {
+        title: title.to_string(),
+        sections: sections
+            .iter()
+            .map(|section| DocumentSection {
+                heading: section
+                    .get("heading")
+                    .and_then(Value::as_str)
+                    .unwrap_or("小节")
+                    .to_string(),
+                body: section
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn collect_presentation(title: &str, audience: &str, slides: &[Value]) -> PresentationData {
+    PresentationData {
+        title: title.to_string(),
+        audience: audience.to_string(),
+        slides: slides
+            .iter()
+            .map(|slide| SlideData {
+                title: slide
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未命名页面")
+                    .to_string(),
+                bullets: slide
+                    .get("bullets")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                notes: slide
+                    .get("speaker_notes")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect(),
+    }
+}
+
+async fn write_office_document(
+    tool_name: &str,
+    path: &Path,
+    format: &str,
+    content: OfficeContent,
+    context: &mut ToolContext,
+) -> Result<ToolOutput> {
+    match (format, content) {
+        ("word" | "docx" | "dotx", OfficeContent::Document(document)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_docx(&document, format == "dotx")?,
+                context,
+                format!("写 Word 文档 {}", path.display()),
+            )
+            .await
+        }
+        ("odt", OfficeContent::Document(document)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_odt(&document)?,
+                context,
+                format!("写 ODT 文档 {}", path.display()),
+            )
+            .await
+        }
+        ("rtf", OfficeContent::Document(document)) => {
+            write_text_file_with_confirmation(
+                tool_name,
+                path,
+                build_rtf(&document),
+                context,
+                format!("写 RTF 文档 {}", path.display()),
+            )
+            .await
+        }
+        ("pdf", OfficeContent::Document(document)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_pdf(&document),
+                context,
+                format!("写 PDF 文档 {}", path.display()),
+            )
+            .await
+        }
+        ("epub", OfficeContent::Document(document)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_epub(&document)?,
+                context,
+                format!("写 EPUB 文档 {}", path.display()),
+            )
+            .await
+        }
+        ("ppt" | "pptx" | "potx", OfficeContent::Presentation(presentation)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_pptx(&presentation, format == "potx")?,
+                context,
+                format!("写 PPT 演示文稿 {}", path.display()),
+            )
+            .await
+        }
+        ("excel" | "xlsx" | "xltx", OfficeContent::Table(rows)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_xlsx(&rows, format == "xltx")?,
+                context,
+                format!("写 Excel 表格 {}", path.display()),
+            )
+            .await
+        }
+        ("ods" | "calc", OfficeContent::Table(rows)) => {
+            write_binary_file_with_confirmation(
+                tool_name,
+                path,
+                build_ods(&rows)?,
+                context,
+                format!("写 ODS 表格 {}", path.display()),
+            )
+            .await
+        }
+        ("csv", OfficeContent::Table(rows)) => {
+            let content = rows
+                .iter()
+                .map(|row| csv_line(row))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            write_text_file_with_confirmation(
+                tool_name,
+                path,
+                content,
+                context,
+                format!("写 CSV 表格 {}", path.display()),
+            )
+            .await
+        }
+        ("tsv" | "xls", OfficeContent::Table(rows)) => {
+            let content = rows
+                .iter()
+                .map(|row| tsv_line(row))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            write_text_file_with_confirmation(
+                tool_name,
+                path,
+                content,
+                context,
+                format!("写表格 {}", path.display()),
+            )
+            .await
+        }
+        (other, _) => anyhow::bail!("内容类型与格式不匹配: {other}"),
+    }
+}
+
+fn build_ods(rows: &[Vec<String>]) -> Result<Vec<u8>> {
+    zip_package(vec![
+        ZipEntry::stored(
+            "mimetype",
+            "application/vnd.oasis.opendocument.spreadsheet"
+                .as_bytes()
+                .to_vec(),
+        ),
+        ZipEntry::deflated("content.xml", build_ods_content_xml(rows).into_bytes()),
+        ZipEntry::deflated("styles.xml", ODS_STYLES_XML.as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "META-INF/manifest.xml",
+            ODS_MANIFEST_XML.as_bytes().to_vec(),
+        ),
+    ])
+}
+
+fn build_odt(document: &DocumentData) -> Result<Vec<u8>> {
+    zip_package(vec![
+        ZipEntry::stored(
+            "mimetype",
+            "application/vnd.oasis.opendocument.text"
+                .as_bytes()
+                .to_vec(),
+        ),
+        ZipEntry::deflated("content.xml", build_odt_content_xml(document).into_bytes()),
+        ZipEntry::deflated("styles.xml", ODS_STYLES_XML.as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "META-INF/manifest.xml",
+            ODT_MANIFEST_XML.as_bytes().to_vec(),
+        ),
+    ])
+}
+
+fn build_docx(document: &DocumentData, template: bool) -> Result<Vec<u8>> {
+    let content_type = if template {
+        DOCX_TEMPLATE_CONTENT_TYPES
+    } else {
+        DOCX_CONTENT_TYPES
+    };
+    zip_package(vec![
+        ZipEntry::deflated("[Content_Types].xml", content_type.as_bytes().to_vec()),
+        ZipEntry::deflated("_rels/.rels", DOCX_RELS.as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "word/document.xml",
+            build_docx_document_xml(document).into_bytes(),
+        ),
+    ])
+}
+
+fn build_pptx(presentation: &PresentationData, template: bool) -> Result<Vec<u8>> {
+    let content_type = if template {
+        PPTX_TEMPLATE_CONTENT_TYPES
+    } else {
+        PPTX_CONTENT_TYPES
+    };
+    let mut slides = Vec::with_capacity(presentation.slides.len() + 1);
+    slides.push(SlideData {
+        title: presentation.title.clone(),
+        bullets: vec![format!("目标受众：{}", presentation.audience)],
+        notes: String::new(),
+    });
+    slides.extend(presentation.slides.clone());
+    let packaged = PresentationData {
+        title: presentation.title.clone(),
+        audience: presentation.audience.clone(),
+        slides,
+    };
+    let mut entries = vec![
+        ZipEntry::deflated("[Content_Types].xml", content_type.as_bytes().to_vec()),
+        ZipEntry::deflated("_rels/.rels", PPTX_RELS.as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "ppt/presentation.xml",
+            build_presentation_xml(&packaged).into_bytes(),
+        ),
+        ZipEntry::deflated(
+            "ppt/_rels/presentation.xml.rels",
+            build_presentation_rels(packaged.slides.len()).into_bytes(),
+        ),
+    ];
+    for (index, slide) in packaged.slides.iter().enumerate() {
+        entries.push(ZipEntry::deflated(
+            format!("ppt/slides/slide{}.xml", index + 1),
+            build_slide_xml(slide).into_bytes(),
+        ));
+    }
+    zip_package(entries)
+}
+
+fn build_xlsx(rows: &[Vec<String>], template: bool) -> Result<Vec<u8>> {
+    let content_type = if template {
+        XLSX_TEMPLATE_CONTENT_TYPES
+    } else {
+        XLSX_CONTENT_TYPES
+    };
+    zip_package(vec![
+        ZipEntry::deflated("[Content_Types].xml", content_type.as_bytes().to_vec()),
+        ZipEntry::deflated("_rels/.rels", XLSX_RELS.as_bytes().to_vec()),
+        ZipEntry::deflated("xl/workbook.xml", XLSX_WORKBOOK.as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "xl/_rels/workbook.xml.rels",
+            XLSX_WORKBOOK_RELS.as_bytes().to_vec(),
+        ),
+        ZipEntry::deflated(
+            "xl/worksheets/sheet1.xml",
+            build_sheet_xml(rows).into_bytes(),
+        ),
+    ])
+}
+
+fn build_epub(document: &DocumentData) -> Result<Vec<u8>> {
+    zip_package(vec![
+        ZipEntry::stored("mimetype", "application/epub+zip".as_bytes().to_vec()),
+        ZipEntry::deflated(
+            "META-INF/container.xml",
+            EPUB_CONTAINER_XML.as_bytes().to_vec(),
+        ),
+        ZipEntry::deflated("OEBPS/content.opf", build_epub_opf(document).into_bytes()),
+        ZipEntry::deflated("OEBPS/toc.ncx", build_epub_toc(document).into_bytes()),
+        ZipEntry::deflated(
+            "OEBPS/chapter.xhtml",
+            build_epub_chapter(document).into_bytes(),
+        ),
+    ])
+}
+
+fn build_rtf(document: &DocumentData) -> String {
+    let mut rtf = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Arial;}}\n");
+    rtf.push_str(&format!(
+        "\\b\\fs32 {}\\b0\\fs24\\par\n",
+        escape_rtf(&document.title)
+    ));
+    for section in &document.sections {
+        rtf.push_str(&format!("\\b {}\\b0\\par\n", escape_rtf(&section.heading)));
+        rtf.push_str(&format!("{}\\par\n", escape_rtf(&section.body)));
+    }
+    rtf.push('}');
+    rtf
+}
+
+fn build_pdf(document: &DocumentData) -> Vec<u8> {
+    let mut lines = vec![document.title.clone()];
+    for section in &document.sections {
+        lines.push(section.heading.clone());
+        lines.extend(section.body.lines().map(ToString::to_string));
+    }
+    let mut stream = String::from("BT /F1 12 Tf 50 780 Td 14 TL ");
+    for line in lines {
+        stream.push_str(&format!("({}) Tj T* ", escape_pdf_text(&line)));
+    }
+    stream.push_str("ET");
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{}\nendstream", stream.len(), stream),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", index + 1, object));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
+    for offset in offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer << /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        objects.len() + 1,
+        xref
+    ));
+    pdf.into_bytes()
+}
+
+struct ZipEntry {
+    path: String,
+    content: Vec<u8>,
+    stored: bool,
+}
+
+impl ZipEntry {
+    fn stored(path: impl Into<String>, content: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            content,
+            stored: true,
+        }
+    }
+
+    fn deflated(path: impl Into<String>, content: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            content,
+            stored: false,
+        }
+    }
+}
+
+fn zip_package(entries: Vec<ZipEntry>) -> Result<Vec<u8>> {
+    let mut buffer = Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut buffer);
+    for entry in entries {
+        let options =
+            zip::write::SimpleFileOptions::default().compression_method(if entry.stored {
+                zip::CompressionMethod::Stored
+            } else {
+                zip::CompressionMethod::Deflated
+            });
+        writer.start_file(entry.path, options)?;
+        writer.write_all(&entry.content)?;
+    }
+    writer.finish()?;
+    Ok(buffer.into_inner())
+}
+
+fn build_ods_content_xml(rows: &[Vec<String>]) -> String {
+    let mut xml = String::from(ODS_CONTENT_PREFIX);
+    for row in rows {
+        xml.push_str("<table:table-row>");
+        for cell in row {
+            xml.push_str("<table:table-cell office:value-type=\"string\"><text:p>");
+            xml.push_str(&escape_xml(cell));
+            xml.push_str("</text:p></table:table-cell>");
+        }
+        xml.push_str("</table:table-row>");
+    }
+    xml.push_str(ODS_CONTENT_SUFFIX);
+    xml
+}
+
+fn build_odt_content_xml(document: &DocumentData) -> String {
+    let mut xml = String::from(ODT_CONTENT_PREFIX);
+    xml.push_str(&format!(
+        "<text:h text:outline-level=\"1\">{}</text:h>",
+        escape_xml(&document.title)
+    ));
+    for section in &document.sections {
+        xml.push_str(&format!(
+            "<text:h text:outline-level=\"2\">{}</text:h><text:p>{}</text:p>",
+            escape_xml(&section.heading),
+            escape_xml(&section.body)
+        ));
+    }
+    xml.push_str(ODT_CONTENT_SUFFIX);
+    xml
+}
+
+fn build_docx_document_xml(document: &DocumentData) -> String {
+    let mut xml = String::from(DOCX_DOCUMENT_PREFIX);
+    xml.push_str(&docx_paragraph(&document.title, true));
+    for section in &document.sections {
+        xml.push_str(&docx_paragraph(&section.heading, true));
+        xml.push_str(&docx_paragraph(&section.body, false));
+    }
+    xml.push_str(DOCX_DOCUMENT_SUFFIX);
+    xml
+}
+
+fn docx_paragraph(text: &str, bold: bool) -> String {
+    let bold_tag = if bold { "<w:rPr><w:b/></w:rPr>" } else { "" };
+    format!(
+        "<w:p><w:r>{}<w:t>{}</w:t></w:r></w:p>",
+        bold_tag,
+        escape_xml(text)
+    )
+}
+
+fn build_presentation_xml(presentation: &PresentationData) -> String {
+    let slides = (1..=presentation.slides.len())
+        .map(|index| format!("<p:sldId id=\"{}\" r:id=\"rId{}\"/>", 255 + index, index))
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "{}<p:sldIdLst>{}</p:sldIdLst><p:sldSz cx=\"9144000\" cy=\"5143500\" type=\"screen16x9\"/></p:presentation>",
+        PPTX_PRESENTATION_PREFIX, slides
+    )
+}
+
+fn build_presentation_rels(slide_count: usize) -> String {
+    let relationships = (1..=slide_count)
+        .map(|index| format!("<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide{}.xml\"/>", index, index))
+        .collect::<Vec<_>>()
+        .join("");
+    format!("{}{}{}", RELS_PREFIX, relationships, RELS_SUFFIX)
+}
+
+fn build_slide_xml(slide: &SlideData) -> String {
+    let mut body = format!("{}\n{}", slide.title, slide.bullets.join("\n"));
+    if !slide.notes.is_empty() {
+        body.push('\n');
+        body.push_str(&slide.notes);
+    }
+    PPTX_SLIDE_XML.replace("{content}", &escape_xml(&body))
+}
+
+fn build_sheet_xml(rows: &[Vec<String>]) -> String {
+    let mut xml = String::from(XLSX_SHEET_PREFIX);
+    for (row_index, row) in rows.iter().enumerate() {
+        xml.push_str(&format!("<row r=\"{}\">", row_index + 1));
+        for (col_index, cell) in row.iter().enumerate() {
+            xml.push_str(&format!(
+                "<c r=\"{}{}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                xlsx_column_name(col_index),
+                row_index + 1,
+                escape_xml(cell)
+            ));
+        }
+        xml.push_str("</row>");
+    }
+    xml.push_str(XLSX_SHEET_SUFFIX);
+    xml
+}
+
+fn xlsx_column_name(mut index: usize) -> String {
+    let mut name = String::new();
+    loop {
+        name.insert(0, (b'A' + (index % 26) as u8) as char);
+        if index < 26 {
+            return name;
+        }
+        index = index / 26 - 1;
+    }
+}
+
+fn build_epub_opf(document: &DocumentData) -> String {
+    EPUB_OPF_XML.replace("{title}", &escape_xml(&document.title))
+}
+
+fn build_epub_toc(document: &DocumentData) -> String {
+    EPUB_TOC_XML.replace("{title}", &escape_xml(&document.title))
+}
+
+fn build_epub_chapter(document: &DocumentData) -> String {
+    let mut body = format!("<h1>{}</h1>", escape_xml(&document.title));
+    for section in &document.sections {
+        body.push_str(&format!(
+            "<h2>{}</h2><p>{}</p>",
+            escape_xml(&section.heading),
+            escape_xml(&section.body)
+        ));
+    }
+    EPUB_CHAPTER_XML.replace("{body}", &body)
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn escape_rtf(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('{', "\\{")
+        .replace('}', "\\}")
+        .replace('\n', "\\line ")
+}
+
+fn escape_pdf_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
+        .replace('\r', " ")
+        .replace('\n', " ")
+}
+
+fn tsv_line(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| value.replace('\t', " ").replace('\n', " "))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+const ODS_CONTENT_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">
+<office:body><office:spreadsheet><table:table table:name="Sheet1">"#;
+
+const ODS_CONTENT_SUFFIX: &str =
+    r#"</table:table></office:spreadsheet></office:body></office:document-content>"#;
+
+const ODS_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"/>"#;
+
+const ODS_MANIFEST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/>
+<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+<manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>"#;
+
+const ODT_CONTENT_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">
+<office:body><office:text>"#;
+
+const ODT_CONTENT_SUFFIX: &str = r#"</office:text></office:body></office:document-content>"#;
+
+const ODT_MANIFEST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>
+<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+<manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>"#;
+
+const RELS_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#;
+const RELS_SUFFIX: &str = r#"</Relationships>"#;
+
+const DOCX_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+const DOCX_TEMPLATE_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"/></Types>"#;
+const DOCX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+const DOCX_DOCUMENT_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#;
+const DOCX_DOCUMENT_SUFFIX: &str = r#"<w:sectPr/></w:body></w:document>"#;
+
+const PPTX_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#;
+const PPTX_TEMPLATE_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#;
+const PPTX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#;
+const PPTX_PRESENTATION_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#;
+const PPTX_SLIDE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Content"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{content}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+
+const XLSX_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
+const XLSX_TEMPLATE_CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
+const XLSX_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+const XLSX_WORKBOOK: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+const XLSX_WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+const XLSX_SHEET_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#;
+const XLSX_SHEET_SUFFIX: &str = r#"</sheetData></worksheet>"#;
+
+const EPUB_CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+const EPUB_OPF_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><package version="2.0" unique-identifier="bookid" xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:language>zh-CN</dc:language><dc:identifier id="bookid">urn:uuid:yunzhi-one-cli</dc:identifier></metadata><manifest><item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine toc="toc"><itemref idref="chapter"/></spine></package>"#;
+const EPUB_TOC_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ncx version="2005-1" xmlns="http://www.daisy.org/z3986/2005/ncx/"><head/><docTitle><text>{title}</text></docTitle><navMap><navPoint id="chapter" playOrder="1"><navLabel><text>正文</text></navLabel><content src="chapter.xhtml"/></navPoint></navMap></ncx>"#;
+const EPUB_CHAPTER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>正文</title></head><body>{body}</body></html>"#;
+
 fn csv_line(values: &[String]) -> String {
     values
         .iter()
@@ -2455,6 +3318,7 @@ impl PermissionPrompter for FixedUserPrompter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use tempfile::tempdir;
 
     fn context(dir: &Path) -> ToolContext {
@@ -2813,6 +3677,127 @@ mod tests {
         assert!(content.contains("\"name\",\"note\""));
         assert!(content.contains("\"yunzhi\",\"hello, world\""));
         assert!(content.contains("\"quote\",\"a \"\" b\""));
+    }
+
+    #[tokio::test]
+    async fn writes_calc_ods_table() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "write_table",
+                json!({
+                    "path":"table.ods",
+                    "format":"calc",
+                    "columns":["name","note"],
+                    "rows":[["yunzhi","A & B"],["tag","<ok>"]]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+
+        let file = std::fs::File::open(dir.path().join("table.ods")).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut content_xml = String::new();
+        archive
+            .by_name("content.xml")
+            .unwrap()
+            .read_to_string(&mut content_xml)
+            .unwrap();
+        assert!(content_xml.contains("table:name=\"Sheet1\""));
+        assert!(content_xml.contains("yunzhi"));
+        assert!(content_xml.contains("A &amp; B"));
+        assert!(content_xml.contains("&lt;ok&gt;"));
+    }
+
+    #[tokio::test]
+    async fn office_document_writes_representative_formats() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+
+        let docx = registry
+            .execute(
+                "office_document",
+                json!({
+                    "path":"report.docx",
+                    "format":"word",
+                    "title":"报告",
+                    "sections":[{"heading":"摘要","body":"hello"}]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!docx.is_error, "{}", docx.content);
+        let file = std::fs::File::open(dir.path().join("report.docx")).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut document_xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut document_xml)
+            .unwrap();
+        assert!(document_xml.contains("hello"));
+
+        let xlsx = registry
+            .execute(
+                "office_document",
+                json!({
+                    "path":"data.xlsx",
+                    "format":"excel",
+                    "columns":["name","value"],
+                    "rows":[["yunzhi","1"]]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!xlsx.is_error, "{}", xlsx.content);
+        let file = std::fs::File::open(dir.path().join("data.xlsx")).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sheet_xml = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet_xml)
+            .unwrap();
+        assert!(sheet_xml.contains("yunzhi"));
+
+        let pptx = registry
+            .execute(
+                "office_document",
+                json!({
+                    "path":"deck.pptx",
+                    "format":"ppt",
+                    "title":"演示",
+                    "slides":[{"title":"第一页","bullets":["要点"]}]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!pptx.is_error, "{}", pptx.content);
+        let file = std::fs::File::open(dir.path().join("deck.pptx")).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("ppt/slides/slide1.xml").is_ok());
+        assert!(archive.by_name("ppt/slides/slide2.xml").is_ok());
+
+        let epub = registry
+            .execute(
+                "office_document",
+                json!({
+                    "path":"book.epub",
+                    "format":"epub",
+                    "title":"电子书",
+                    "sections":[{"heading":"章","body":"内容"}]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!epub.is_error, "{}", epub.content);
+        let file = std::fs::File::open(dir.path().join("book.epub")).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("OEBPS/chapter.xhtml").is_ok());
     }
 
     #[tokio::test]

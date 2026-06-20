@@ -52,7 +52,7 @@ yunzhi
 - 内置模式：`chat`、`plan-act`、`entanglement`、`agent`、`team`、`analyze`。
 - 预留 `LlmClient` trait，真实接口格式变化时可替换适配层。
 - 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`ask_user`、`choose_option`、`list_models`、`list_skills`、`read_skill`、`list_mcp_servers`、`call_mcp_tool`、`manage_todos`、`system_control`、`call_model`。
-- 支持一组高层生产力工具：`create_presentation` 制作可转 PPT 的 Marp Markdown，`generate_image` 调用绘图/多模态模型生成图片结果，`write_document` 写文档，`write_table` 写 Markdown/CSV 表格，`ui_design` 生成 UI 智能设计规格。
+- 支持一组高层生产力工具：`create_presentation` 制作可转 PPT 的 Marp Markdown 或 PPTX/POTX，`generate_image` 调用绘图/多模态模型生成图片结果，`write_document` 写 Markdown/Word/PDF/ODT/RTF/DOCX/DOTX/EPUB 文档，`write_table` 写 Markdown/CSV/TSV/Excel/XLSX/XLTX/XLS/ODS 表格，`office_document` 统一生成 Word、PPT、Excel、PDF、ODT、RTF、XLSX、ODS、TSV、CSV、XLS、XLTX、DOTX、DOCX、POTX、PPTX、EPUB，`ui_design` 生成 UI 智能设计规格。
 - 支持电脑与网络操作：`disk_manager` 管理磁盘用量、大文件和空目录，`computer_manager` 查看/打开/运行电脑任务，`computer_info` 获取系统、CPU、内存、磁盘、网络和环境信息，`web_search` 拉取网络搜索结果，`browser` 获取或打开网页，`network_logs` 获取连接、路由、DNS、ping 和响应头信息。
 - 支持数据与记忆操作：`database_manager` 调用 sqlite/psql/mysql/redis-cli 查询或管理数据库，`long_memory` 读取、追加、替换或清空项目长期记忆 `.yunzhi/memory.md`。
 - 主模型可以通过 `list_models` 读取云智 API 可用模型列表，并通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
