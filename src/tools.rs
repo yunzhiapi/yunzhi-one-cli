@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::fs;
 use tokio::process::Command;
 use tokio::time::timeout;
 use walkdir::WalkDir;
@@ -89,6 +90,9 @@ fn is_safe_operation(tool_name: &str) -> bool {
         "read_file"
             | "write_file"
             | "edit_file"
+            | "append_file"
+            | "create_dir"
+            | "file_info"
             | "list_dir"
             | "glob_search"
             | "grep_search"
@@ -142,6 +146,12 @@ impl ToolRegistry {
         registry.register(ReadFileTool);
         registry.register(WriteFileTool);
         registry.register(EditFileTool);
+        registry.register(AppendFileTool);
+        registry.register(CreateDirTool);
+        registry.register(CopyPathTool);
+        registry.register(MovePathTool);
+        registry.register(DeletePathTool);
+        registry.register(FileInfoTool);
         registry.register(BashTool);
         registry.register(GlobSearchTool);
         registry.register(GrepSearchTool);
@@ -332,6 +342,221 @@ impl Tool for EditFileTool {
     }
 }
 
+struct AppendFileTool;
+
+#[async_trait]
+impl Tool for AppendFileTool {
+    fn name(&self) -> &'static str {
+        "append_file"
+    }
+    fn description(&self) -> &'static str {
+        "向工作目录内的文本文件末尾追加内容，执行前展示 diff 并请求确认"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let content = string_arg(&args, "content")?;
+        let old = fs::read_to_string(&path).await.unwrap_or_default();
+        let mut new = old.clone();
+        new.push_str(&content);
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("追加文件 {}", path.display()),
+                diff: Some(diff_text(&old, &new)),
+            })
+            .await?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&path, new)
+            .await
+            .with_context(|| format!("追加文件失败: {}", path.display()))?;
+        Ok(ToolOutput::ok(format!("已追加 {}", path.display())))
+    }
+}
+
+struct CreateDirTool;
+
+#[async_trait]
+impl Tool for CreateDirTool {
+    fn name(&self) -> &'static str {
+        "create_dir"
+    }
+    fn description(&self) -> &'static str {
+        "在工作目录内创建目录，可递归创建父目录"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("创建目录 {}", path.display()),
+                diff: None,
+            })
+            .await?;
+        fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("创建目录失败: {}", path.display()))?;
+        Ok(ToolOutput::ok(format!("已创建目录 {}", path.display())))
+    }
+}
+
+struct CopyPathTool;
+
+#[async_trait]
+impl Tool for CopyPathTool {
+    fn name(&self) -> &'static str {
+        "copy_path"
+    }
+    fn description(&self) -> &'static str {
+        "复制工作目录内的文件或目录，执行前请求确认"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let source = resolve_path(&context.cwd, &string_arg(&args, "source")?)?;
+        let destination = resolve_path(&context.cwd, &string_arg(&args, "destination")?)?;
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("复制 {} 到 {}", source.display(), destination.display()),
+                diff: None,
+            })
+            .await?;
+        copy_path(&source, &destination).await?;
+        Ok(ToolOutput::ok(format!(
+            "已复制 {} 到 {}",
+            source.display(),
+            destination.display()
+        )))
+    }
+}
+
+struct MovePathTool;
+
+#[async_trait]
+impl Tool for MovePathTool {
+    fn name(&self) -> &'static str {
+        "move_path"
+    }
+    fn description(&self) -> &'static str {
+        "移动或重命名工作目录内的文件或目录，执行前请求确认"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let source = resolve_path(&context.cwd, &string_arg(&args, "source")?)?;
+        let destination = resolve_path(&context.cwd, &string_arg(&args, "destination")?)?;
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("移动 {} 到 {}", source.display(), destination.display()),
+                diff: None,
+            })
+            .await?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::rename(&source, &destination).await.with_context(|| {
+            format!("移动路径失败: {} -> {}", source.display(), destination.display())
+        })?;
+        Ok(ToolOutput::ok(format!(
+            "已移动 {} 到 {}",
+            source.display(),
+            destination.display()
+        )))
+    }
+}
+
+struct DeletePathTool;
+
+#[async_trait]
+impl Tool for DeletePathTool {
+    fn name(&self) -> &'static str {
+        "delete_path"
+    }
+    fn description(&self) -> &'static str {
+        "删除工作目录内的文件或目录，目录删除需要 recursive=true，执行前请求确认"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean","description":"删除目录时必须为 true"}},"required":["path"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let recursive = args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("删除路径 {}", path.display()),
+                diff: None,
+            })
+            .await?;
+        let metadata = fs::metadata(&path)
+            .await
+            .with_context(|| format!("读取路径信息失败: {}", path.display()))?;
+        if metadata.is_dir() {
+            anyhow::ensure!(recursive, "删除目录必须设置 recursive=true");
+            fs::remove_dir_all(&path).await?;
+        } else {
+            fs::remove_file(&path).await?;
+        }
+        Ok(ToolOutput::ok(format!("已删除 {}", path.display())))
+    }
+}
+
+struct FileInfoTool;
+
+#[async_trait]
+impl Tool for FileInfoTool {
+    fn name(&self) -> &'static str {
+        "file_info"
+    }
+    fn description(&self) -> &'static str {
+        "查看工作目录内文件或目录的类型、大小和修改时间"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let metadata = fs::metadata(&path)
+            .await
+            .with_context(|| format!("读取路径信息失败: {}", path.display()))?;
+        let kind = if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(ToolOutput::ok(format!(
+            "path: {}\ntype: {}\nsize: {}\nreadonly: {}\nmodified_unix: {}",
+            path.strip_prefix(&context.cwd).unwrap_or(&path).display(),
+            kind,
+            metadata.len(),
+            metadata.permissions().readonly(),
+            modified
+        )))
+    }
+}
+
 struct BashTool;
 
 #[async_trait]
@@ -513,7 +738,7 @@ impl Tool for CallModelTool {
         json!({
             "type":"object",
             "properties":{
-                "model":{"type":"string","description":"要调用的模型名称，不能是主模型 Claude-Opus-4.6 时用于委托其他模型"},
+                "model":{"type":"string","description":"要调用的模型名称，不能是主模型 Gemini-3.5-Flash 时用于委托其他模型"},
                 "prompt":{"type":"string","description":"发送给目标模型的任务内容"},
                 "system":{"type":"string","description":"可选 system 指令"},
                 "max_tokens":{"type":"integer","description":"最大输出 token，默认 2048"}
@@ -788,6 +1013,43 @@ impl Tool for SystemControlTool {
     }
 }
 
+async fn copy_path(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::metadata(source)
+        .await
+        .with_context(|| format!("读取源路径失败: {}", source.display()))?;
+    if metadata.is_dir() {
+        copy_dir_recursive(source, destination)
+            .with_context(|| format!("复制目录失败: {} -> {}", source.display(), destination.display()))
+    } else {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(source, destination).await.with_context(|| {
+            format!("复制文件失败: {} -> {}", source.display(), destination.display())
+        })?;
+        Ok(())
+    }
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
+}
+
 async fn run_command(command: Vec<String>, cwd: &Path, timeout_secs: u64) -> Result<ToolOutput> {
     anyhow::ensure!(!command.is_empty(), "命令不能为空");
     let started = Instant::now();
@@ -970,5 +1232,105 @@ mod tests {
             .execute("system_control", json!({"action":"pwd"}), &mut ctx)
             .await;
         assert_eq!(output.content, dir.path().display().to_string());
+    }
+
+    #[tokio::test]
+    async fn appends_and_reports_file_info() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        registry
+            .execute(
+                "write_file",
+                json!({"path":"notes.txt","content":"hello"}),
+                &mut ctx,
+            )
+            .await;
+        let output = registry
+            .execute(
+                "append_file",
+                json!({"path":"notes.txt","content":" world"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let output = registry
+            .execute("read_file", json!({"path":"notes.txt"}), &mut ctx)
+            .await;
+        assert_eq!(output.content, "hello world");
+        let output = registry
+            .execute("file_info", json!({"path":"notes.txt"}), &mut ctx)
+            .await;
+        assert!(output.content.contains("type: file"));
+        assert!(output.content.contains("size: 11"));
+    }
+
+    #[tokio::test]
+    async fn creates_copies_moves_and_deletes_paths() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute("create_dir", json!({"path":"a/b"}), &mut ctx)
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        registry
+            .execute(
+                "write_file",
+                json!({"path":"a/b/source.txt","content":"copy me"}),
+                &mut ctx,
+            )
+            .await;
+        let output = registry
+            .execute(
+                "copy_path",
+                json!({"source":"a","destination":"copied"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let output = registry
+            .execute(
+                "read_file",
+                json!({"path":"copied/b/source.txt"}),
+                &mut ctx,
+            )
+            .await;
+        assert_eq!(output.content, "copy me");
+        let output = registry
+            .execute(
+                "move_path",
+                json!({"source":"copied/b/source.txt","destination":"moved.txt"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let output = registry
+            .execute("read_file", json!({"path":"moved.txt"}), &mut ctx)
+            .await;
+        assert_eq!(output.content, "copy me");
+        let output = registry
+            .execute(
+                "delete_path",
+                json!({"path":"copied","recursive":true}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(!dir.path().join("copied").exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_non_recursive_directory_delete() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        registry
+            .execute("create_dir", json!({"path":"nested"}), &mut ctx)
+            .await;
+        let output = registry
+            .execute("delete_path", json!({"path":"nested"}), &mut ctx)
+            .await;
+        assert!(output.is_error);
     }
 }

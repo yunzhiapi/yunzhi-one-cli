@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const DEFAULT_BASE_URL: &str = "https://yunzhiapi.cn/v1";
-pub const DEFAULT_MODEL: &str = "Claude-Opus-4.6";
+pub const DEFAULT_MODEL: &str = "Gemini-3.5-Flash";
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -193,6 +193,12 @@ impl LlmClient for ChatCompletionsClient {
                     if raw_event.trim().is_empty() {
                         continue;
                     }
+                    
+                    // 调试日志：打印原始 SSE 事件
+                    if std::env::var("YUNZHI_DEBUG").is_ok() {
+                        eprintln!("[DEBUG SSE] {}", raw_event);
+                    }
+                    
                     match parse_sse_event(&raw_event, &mut pending_tools) {
                         Ok(events) => {
                             for event in events {
@@ -246,6 +252,20 @@ impl ChatCompletionsClient {
             tools: request.tools.iter().map(to_chat_tool).collect(),
             tool_choice: (!request.tools.is_empty()).then(|| request.tool_choice.to_value()),
         };
+        
+        // 调试日志：打印请求体
+        if std::env::var("YUNZHI_DEBUG").is_ok() {
+            eprintln!("[DEBUG REQUEST] tools count: {}", request.tools.len());
+            eprintln!("[DEBUG REQUEST] tool_choice: {:?}", request.tool_choice);
+            if let Some(ref tc) = body.tool_choice {
+                eprintln!("[DEBUG REQUEST] tool_choice JSON: {}", tc);
+            }
+            if !body.tools.is_empty() {
+                eprintln!("[DEBUG REQUEST] first tool: {}", serde_json::to_string_pretty(&body.tools[0]).unwrap_or_default());
+            }
+            eprintln!("[DEBUG REQUEST] full body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        }
+        
         self.send_json(body).await
     }
 
@@ -397,6 +417,12 @@ fn parse_sse_event(
 
     let value: Value =
         serde_json::from_str(&data).with_context(|| format!("解析 SSE 数据失败: {data}"))?;
+    
+    // 调试日志：打印解析后的 JSON
+    if std::env::var("YUNZHI_DEBUG").is_ok() {
+        eprintln!("[DEBUG JSON] {}", serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
+    
     if let Some(error) = value.get("error") {
         anyhow::bail!("云智 API 流式错误: {}", error);
     }
@@ -515,7 +541,7 @@ mod tests {
     #[test]
     fn serializes_tool_choice_auto_when_tools_exist() {
         let body = ChatCompletionsRequest {
-            model: "Claude-Opus-4.6",
+            model: "Gemini-3.5-Flash",
             max_tokens: 4096,
             stream: true,
             messages: Vec::new(),
