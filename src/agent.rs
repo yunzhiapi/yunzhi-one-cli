@@ -22,6 +22,18 @@ const PLAN_READ_ONLY_TOOLS: &[&str] = &[
     "read_skill",
     "list_mcp_servers",
 ];
+const ANALYZE_READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "glob_search",
+    "grep_search",
+    "file_info",
+    "list_models",
+    "call_model",
+    "list_skills",
+    "read_skill",
+    "list_mcp_servers",
+];
 
 pub struct Agent<C: LlmClient> {
     client: C,
@@ -121,6 +133,8 @@ impl<C: LlmClient> Agent<C> {
                 messages: self.history.clone(),
                 tools: if plan_act_planning {
                     self.tools.definitions_for(PLAN_READ_ONLY_TOOLS)
+                } else if matches!(self.options.mode, AgentMode::Analyze) {
+                    self.tools.definitions_for(ANALYZE_READ_ONLY_TOOLS)
                 } else {
                     self.tools.definitions()
                 },
@@ -221,6 +235,9 @@ impl<C: LlmClient> Agent<C> {
         }
         if matches!(self.options.mode, AgentMode::Entanglement) {
             return entanglement_turn_input(&input);
+        }
+        if matches!(self.options.mode, AgentMode::Analyze) {
+            return analyze_turn_input(&input);
         }
         input
     }
@@ -377,6 +394,13 @@ fn entanglement_turn_input(input: &str) -> String {
     )
 }
 
+fn analyze_turn_input(input: &str) -> String {
+    format!(
+        "Analyze 模式任务。此模式只允许只读分析工具和模型交叉审查，不允许写入、编辑、删除、执行命令、运行程序或调用 MCP 工具。\n\n分析协议：\n1. 先用只读工具收集必要证据，优先读取相关文件、列目录、搜索文本和查看文件信息。\n2. 明确区分事实、推断和不确定项；不要把未验证的猜测写成结论。\n3. 对复杂、高风险或架构性判断，可以用 list_models 和 call_model 委托一个子模型做独立审查。\n4. 输出结构必须包含：问题定位、证据、风险等级、影响范围、可选方案、推荐方案和验证建议。\n5. 如果用户要求修改或执行，只给出建议和可执行计划；提醒需要切换到 agent/team/plan-act 或显式使用执行模式。\n\n用户请求:\n{}",
+        input
+    )
+}
+
 fn mode_prompt(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Chat => "chat 模式：以解释、问答和轻量建议为主。除非用户明确要求修改或运行，否则优先不调用会改变环境的工具。",
@@ -384,7 +408,7 @@ fn mode_prompt(mode: AgentMode) -> &'static str {
         AgentMode::Entanglement => "entanglement 模式：把用户目标、代码、工具、Skills、MCP、可用模型和不确定性视为同一个协同系统。先建立纠缠图和假设矩阵，再用只读工具求证关键事实；复杂或高风险判断必须通过 call_model 做独立反证或交叉检查。修改前先给出证据链，完成后总结已确认事实、剩余纠缠点和下一位被唤醒的上下文/子模型。",
         AgentMode::Agent => "agent 模式：默认自主完成软件开发任务；在需求清楚时必须直接调用工具读取、编辑、测试和总结，不要用对话确认替代工具操作，遇到高风险操作由工具权限确认接管。",
         AgentMode::Team => "team 模式：主模型担任 CEO/调度器。每个新任务第一步必须调用 list_models 获取可用模型列表，然后按需求用 call_model 分配子智能体任务。子智能体可处于 waiting/running/done 状态；某智能体完成后，主模型根据交付物唤醒下一位智能体，并把必要上下文传给它，形成一个人一个公司的流水线。",
-        AgentMode::Analyze => "analyze 模式：以只读分析、定位问题、风险评估和方案比较为主；除非用户明确授权，避免修改文件或执行破坏性操作。",
+        AgentMode::Analyze => "analyze 模式：代码层只暴露只读分析工具、Skill/MCP 列表和 call_model 交叉审查能力；不提供写入、编辑、删除、执行命令、运行程序或 call_mcp_tool。重点是定位问题、证据链、风险评估、影响范围、方案比较和验证建议。若用户要求修改或执行，只输出计划并提示切换到 agent/team/plan-act 等执行模式。",
     }
 }
 
@@ -452,6 +476,14 @@ mod tests {
     }
 
     #[test]
+    fn analyze_wraps_turn_with_read_only_protocol() {
+        let prepared = analyze_turn_input("评审实现风险");
+        assert!(prepared.contains("只允许只读分析工具"));
+        assert!(prepared.contains("风险等级"));
+        assert!(prepared.contains("用户请求:\n评审实现风险"));
+    }
+
+    #[test]
     fn recognizes_act_approval() {
         assert!(is_act_approval("act"));
         assert!(is_act_approval("执行"));
@@ -469,5 +501,21 @@ mod tests {
         assert!(!PLAN_READ_ONLY_TOOLS.contains(&"bash"));
         assert!(!PLAN_READ_ONLY_TOOLS.contains(&"call_mcp_tool"));
         assert!(!PLAN_READ_ONLY_TOOLS.contains(&"run_program"));
+    }
+
+    #[test]
+    fn analyze_tools_are_read_only() {
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"read_file"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"call_model"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"read_skill"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"list_mcp_servers"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"write_file"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"edit_file"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"delete_path"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"bash"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"execute_code"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"run_program"));
+        assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"call_mcp_tool"));
     }
 }
