@@ -4,6 +4,7 @@ pub mod config;
 pub mod extensions;
 pub mod hooks;
 pub mod llm;
+pub mod mcp_server;
 pub mod observability;
 pub mod session;
 pub mod tools;

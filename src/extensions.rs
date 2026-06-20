@@ -92,6 +92,64 @@ pub async fn call_mcp_tool(
     arguments: Value,
     timeout_secs: u64,
 ) -> Result<Value> {
+    call_mcp_method(
+        cwd,
+        server_name,
+        "tools/call",
+        json!({"name": tool_name, "arguments": arguments}),
+        timeout_secs,
+    )
+    .await
+}
+
+pub async fn list_mcp_resources(cwd: &Path, server_name: &str, timeout_secs: u64) -> Result<Value> {
+    call_mcp_method(cwd, server_name, "resources/list", json!({}), timeout_secs).await
+}
+
+pub async fn read_mcp_resource(
+    cwd: &Path,
+    server_name: &str,
+    uri: &str,
+    timeout_secs: u64,
+) -> Result<Value> {
+    call_mcp_method(
+        cwd,
+        server_name,
+        "resources/read",
+        json!({"uri": uri}),
+        timeout_secs,
+    )
+    .await
+}
+
+pub async fn list_mcp_prompts(cwd: &Path, server_name: &str, timeout_secs: u64) -> Result<Value> {
+    call_mcp_method(cwd, server_name, "prompts/list", json!({}), timeout_secs).await
+}
+
+pub async fn get_mcp_prompt(
+    cwd: &Path,
+    server_name: &str,
+    name: &str,
+    arguments: Value,
+    timeout_secs: u64,
+) -> Result<Value> {
+    call_mcp_method(
+        cwd,
+        server_name,
+        "prompts/get",
+        json!({"name": name, "arguments": arguments}),
+        timeout_secs,
+    )
+    .await
+}
+
+pub async fn call_mcp_method(
+    cwd: &Path,
+    server_name: &str,
+    method: &str,
+    params: Value,
+    timeout_secs: u64,
+) -> Result<Value> {
     let servers = load_mcp_servers(cwd)?;
     let server = servers
         .get(server_name)
@@ -140,8 +198,8 @@ pub async fn call_mcp_tool(
                 json!({
                     "jsonrpc": "2.0",
                     "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": tool_name, "arguments": arguments}
+                    "method": method,
+                    "params": params
                 }),
             )
             .await?;
@@ -150,7 +208,7 @@ pub async fn call_mcp_tool(
 
     let result = timeout(Duration::from_secs(timeout_secs.clamp(1, 600)), run)
         .await
-        .map_err(|_| anyhow!("MCP 调用超时: {server_name}/{tool_name}"))?;
+        .map_err(|_| anyhow!("MCP 调用超时: {server_name}/{method}"))?;
     let _ = child.kill().await;
     result
 }

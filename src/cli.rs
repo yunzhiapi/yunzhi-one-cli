@@ -3,6 +3,7 @@ use crate::config::{
     ensure_config_interactive, load_config, load_profile, masked_key, save_config,
 };
 use crate::llm::AnthropicLikeClient;
+use crate::mcp_server;
 use crate::tui::{self, StdoutPrompter};
 use crate::types::{AgentMode, AgentOptions, AppConfig};
 use anyhow::Result;
@@ -48,6 +49,8 @@ pub enum Commands {
         mode: Option<AgentMode>,
         prompt: String,
     },
+    /// 以 MCP stdio server 模式运行，供 IDE 插件等 MCP client 调用
+    McpServer,
 }
 
 #[derive(Debug, Subcommand)]
@@ -70,6 +73,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Some(Commands::McpServer) => run_mcp_server(cli.profile).await,
         None => {
             if let Some(prompt) = cli.prompt {
                 run_print(
@@ -84,6 +88,20 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
     }
+}
+
+async fn run_mcp_server(profile: Option<String>) -> Result<()> {
+    let config = load_runtime_config(profile)?;
+    mcp_server::run_stdio_server(std::env::current_dir()?, config.api_key).await
+}
+
+fn load_runtime_config(profile_name: Option<String>) -> Result<AppConfig> {
+    let config = ensure_config_interactive()?;
+    if let Some(name) = profile_name.as_deref() {
+        let cwd = std::env::current_dir()?;
+        load_profile(&cwd, name)?.ok_or_else(|| anyhow::anyhow!("未找到 profile: {name}"))?;
+    }
+    Ok(config)
 }
 
 fn run_config(command: ConfigCommand) -> Result<()> {

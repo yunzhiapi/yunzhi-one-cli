@@ -1,4 +1,7 @@
-use crate::extensions::{call_mcp_tool, load_mcp_servers, read_skill, skills_index};
+use crate::extensions::{
+    call_mcp_tool, get_mcp_prompt, list_mcp_prompts, list_mcp_resources, load_mcp_servers,
+    read_mcp_resource, read_skill, skills_index,
+};
 use crate::llm::ChatCompletionsClient;
 use crate::types::{ToolDefinition, ToolOutput};
 use anyhow::{anyhow, Context, Result};
@@ -131,6 +134,8 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "list_skills"
             | "read_skill"
             | "list_mcp_servers"
+            | "mcp_resource"
+            | "mcp_prompt"
             | "call_model"
             | "create_presentation"
             | "generate_image"
@@ -204,6 +209,8 @@ impl ToolRegistry {
         registry.register(ReadSkillTool);
         registry.register(ListMcpServersTool);
         registry.register(CallMcpTool);
+        registry.register(McpResourceTool);
+        registry.register(McpPromptTool);
         registry.register(CallModelTool);
         registry.register(AskUserTool);
         registry.register(ChooseOptionTool);
@@ -1653,6 +1660,85 @@ impl Tool for CallMcpTool {
             })
             .await?;
         let result = call_mcp_tool(&context.cwd, &server, &tool, arguments, timeout_secs).await?;
+        Ok(ToolOutput::ok(serde_json::to_string_pretty(&result)?))
+    }
+}
+
+struct McpResourceTool;
+
+#[async_trait]
+impl Tool for McpResourceTool {
+    fn name(&self) -> &'static str {
+        "mcp_resource"
+    }
+    fn description(&self) -> &'static str {
+        "按 MCP 官方 resources/list 与 resources/read 读取已配置 MCP server 的资源"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "server":{"type":"string","description":"MCP server 名称"},
+                "action":{"type":"string","enum":["list","read"],"description":"list 列资源，read 读取资源"},
+                "uri":{"type":"string","description":"action=read 时的资源 URI"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+            },
+            "required":["server","action"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let server = string_arg(&args, "server")?;
+        let action = string_arg(&args, "action")?;
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        let result = match action.as_str() {
+            "list" => list_mcp_resources(&context.cwd, &server, timeout_secs).await?,
+            "read" => {
+                let uri = string_arg(&args, "uri")?;
+                read_mcp_resource(&context.cwd, &server, &uri, timeout_secs).await?
+            }
+            other => anyhow::bail!("未知 mcp_resource action: {other}"),
+        };
+        Ok(ToolOutput::ok(serde_json::to_string_pretty(&result)?))
+    }
+}
+
+struct McpPromptTool;
+
+#[async_trait]
+impl Tool for McpPromptTool {
+    fn name(&self) -> &'static str {
+        "mcp_prompt"
+    }
+    fn description(&self) -> &'static str {
+        "按 MCP 官方 prompts/list 与 prompts/get 列出和获取已配置 MCP server 的提示模板"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "server":{"type":"string","description":"MCP server 名称"},
+                "action":{"type":"string","enum":["list","get"],"description":"list 列模板，get 获取模板"},
+                "name":{"type":"string","description":"action=get 时的 prompt 名称"},
+                "arguments":{"type":"object","description":"prompt 模板参数"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+            },
+            "required":["server","action"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let server = string_arg(&args, "server")?;
+        let action = string_arg(&args, "action")?;
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        let result = match action.as_str() {
+            "list" => list_mcp_prompts(&context.cwd, &server, timeout_secs).await?,
+            "get" => {
+                let name = string_arg(&args, "name")?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                anyhow::ensure!(arguments.is_object(), "arguments 必须是对象");
+                get_mcp_prompt(&context.cwd, &server, &name, arguments, timeout_secs).await?
+            }
+            other => anyhow::bail!("未知 mcp_prompt action: {other}"),
+        };
         Ok(ToolOutput::ok(serde_json::to_string_pretty(&result)?))
     }
 }
