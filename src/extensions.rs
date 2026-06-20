@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,21 +16,44 @@ pub struct SkillInfo {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct McpConfigFile {
     #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     servers: BTreeMap<String, McpServerConfig>,
-    #[serde(default, rename = "mcpServers")]
+    #[serde(
+        default,
+        rename = "mcpServers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionScope {
+    Project,
+    User,
+}
+
+impl ExtensionScope {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "project" | "local" | "workspace" => Ok(Self::Project),
+            "user" | "global" => Ok(Self::User),
+            other => anyhow::bail!("未知扩展作用域: {other}，可选 project 或 user"),
+        }
+    }
 }
 
 pub fn skills_index(cwd: &Path) -> Result<Vec<SkillInfo>> {
@@ -69,6 +92,34 @@ pub fn read_skill(cwd: &Path, id_or_path: &str) -> Result<(SkillInfo, String)> {
     anyhow::bail!("未找到 Skill: {requested}")
 }
 
+pub fn add_skill(
+    cwd: &Path,
+    scope: ExtensionScope,
+    id: &str,
+    description: &str,
+    body: &str,
+    overwrite: bool,
+) -> Result<PathBuf> {
+    let id = normalize_extension_id(id, "skill")?;
+    let root = skill_root_for_scope(cwd, scope)?;
+    let path = root.join(&id).join("SKILL.md");
+    if path.exists() && !overwrite {
+        anyhow::bail!(
+            "Skill 已存在: {}，如需覆盖请设置 overwrite=true",
+            path.display()
+        );
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Skill 路径无父目录: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("创建 Skill 目录失败: {}", parent.display()))?;
+    let content = render_skill_content(&id, description, body);
+    std::fs::write(&path, content)
+        .with_context(|| format!("写入 Skill 失败: {}", path.display()))?;
+    Ok(path)
+}
+
 pub fn load_mcp_servers(cwd: &Path) -> Result<BTreeMap<String, McpServerConfig>> {
     let mut servers = BTreeMap::new();
     for path in mcp_config_paths(cwd) {
@@ -83,6 +134,39 @@ pub fn load_mcp_servers(cwd: &Path) -> Result<BTreeMap<String, McpServerConfig>>
         servers.extend(config.mcp_servers);
     }
     Ok(servers)
+}
+
+pub fn add_mcp_server(
+    cwd: &Path,
+    scope: ExtensionScope,
+    name: &str,
+    server: McpServerConfig,
+    overwrite: bool,
+) -> Result<PathBuf> {
+    let name = normalize_extension_id(name, "MCP server")?;
+    anyhow::ensure!(!server.command.trim().is_empty(), "MCP command 不能为空");
+    let path = mcp_config_path_for_scope(cwd, scope)?;
+    let mut config = if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取 MCP 配置失败: {}", path.display()))?;
+        serde_json::from_str::<McpConfigFile>(&raw)
+            .with_context(|| format!("解析 MCP 配置失败: {}", path.display()))?
+    } else {
+        McpConfigFile::default()
+    };
+    if config.mcp_servers.contains_key(&name) && !overwrite {
+        anyhow::bail!("MCP server 已存在: {name}，如需覆盖请设置 overwrite=true");
+    }
+    config.servers.remove(&name);
+    config.mcp_servers.insert(name, server);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建 MCP 配置目录失败: {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(&config).context("序列化 MCP 配置失败")?;
+    std::fs::write(&path, format!("{raw}\n"))
+        .with_context(|| format!("写入 MCP 配置失败: {}", path.display()))?;
+    Ok(path)
 }
 
 pub async fn call_mcp_tool(
@@ -221,6 +305,15 @@ fn skill_roots(cwd: &Path) -> Vec<PathBuf> {
     roots
 }
 
+fn skill_root_for_scope(cwd: &Path, scope: ExtensionScope) -> Result<PathBuf> {
+    match scope {
+        ExtensionScope::Project => Ok(cwd.join(".yunzhi").join("skills")),
+        ExtensionScope::User => dirs::home_dir()
+            .map(|home| home.join(".yunzhi").join("skills"))
+            .ok_or_else(|| anyhow!("无法确定用户主目录")),
+    }
+}
+
 fn collect_skills_from_root(root: &Path, skills: &mut Vec<SkillInfo>) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -296,6 +389,49 @@ fn mcp_config_paths(cwd: &Path) -> Vec<PathBuf> {
         paths.push(home.join(".yunzhi").join("mcp.json"));
     }
     paths
+}
+
+fn mcp_config_path_for_scope(cwd: &Path, scope: ExtensionScope) -> Result<PathBuf> {
+    match scope {
+        ExtensionScope::Project => Ok(cwd.join(".yunzhi").join("mcp.json")),
+        ExtensionScope::User => dirs::home_dir()
+            .map(|home| home.join(".yunzhi").join("mcp.json"))
+            .ok_or_else(|| anyhow!("无法确定用户主目录")),
+    }
+}
+
+fn normalize_extension_id(id: &str, kind: &str) -> Result<String> {
+    let id = id.trim().trim_matches('/').to_string();
+    anyhow::ensure!(!id.is_empty(), "{kind} 名称不能为空");
+    anyhow::ensure!(
+        !id.contains("..")
+            && !id.starts_with('.')
+            && id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/')),
+        "{kind} 名称只能包含字母、数字、-、_ 和 /，且不能包含 .. 或隐藏路径"
+    );
+    Ok(id)
+}
+
+fn render_skill_content(id: &str, description: &str, body: &str) -> String {
+    let description = description.trim();
+    let title = id
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(id);
+    let body = body.trim();
+    format!(
+        "---\ndescription: {}\n---\n# {}\n\n{}\n",
+        yaml_quote(description),
+        title,
+        body
+    )
+}
+
+fn yaml_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 async fn send_jsonrpc(stdin: &mut tokio::process::ChildStdin, value: Value) -> Result<()> {
@@ -380,5 +516,50 @@ mod tests {
         let servers = load_mcp_servers(dir.path()).unwrap();
         assert_eq!(servers["fs"].command, "node");
         assert_eq!(servers["fs"].args, vec!["server.js"]);
+    }
+
+    #[test]
+    fn adds_project_skill() {
+        let dir = tempdir().unwrap();
+
+        let path = add_skill(
+            dir.path(),
+            ExtensionScope::Project,
+            "code/review",
+            "Review helper",
+            "Use care.",
+            false,
+        )
+        .unwrap();
+
+        assert!(path.ends_with(".yunzhi/skills/code/review/SKILL.md"));
+        let skills = skills_index(dir.path()).unwrap();
+        assert!(skills.iter().any(|skill| skill.id == "code/review"));
+        let (_, content) = read_skill(dir.path(), "code/review").unwrap();
+        assert!(content.contains("Use care."));
+    }
+
+    #[test]
+    fn adds_project_mcp_server() {
+        let dir = tempdir().unwrap();
+
+        let path = add_mcp_server(
+            dir.path(),
+            ExtensionScope::Project,
+            "demo",
+            McpServerConfig {
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                env: BTreeMap::from([("TOKEN".to_string(), "abc".to_string())]),
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(path.ends_with(".yunzhi/mcp.json"));
+        let servers = load_mcp_servers(dir.path()).unwrap();
+        assert_eq!(servers["demo"].command, "node");
+        assert_eq!(servers["demo"].args, vec!["server.js"]);
+        assert_eq!(servers["demo"].env["TOKEN"], "abc");
     }
 }

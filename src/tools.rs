@@ -2,8 +2,8 @@ use crate::config::{
     parse_memory_entries, render_memory_entry, search_memory_entries, MemoryEntry,
 };
 use crate::extensions::{
-    call_mcp_tool, get_mcp_prompt, list_mcp_prompts, list_mcp_resources, load_mcp_servers,
-    read_mcp_resource, read_skill, skills_index,
+    add_mcp_server, add_skill, call_mcp_tool, get_mcp_prompt, list_mcp_prompts, list_mcp_resources,
+    load_mcp_servers, read_mcp_resource, read_skill, skills_index, ExtensionScope, McpServerConfig,
 };
 use crate::llm::ChatCompletionsClient;
 use crate::types::{ToolDefinition, ToolOutput};
@@ -136,7 +136,9 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "list_models"
             | "list_skills"
             | "read_skill"
+            | "add_skill"
             | "list_mcp_servers"
+            | "add_mcp_server"
             | "mcp_resource"
             | "mcp_prompt"
             | "call_model"
@@ -210,7 +212,9 @@ impl ToolRegistry {
         registry.register(ListModelsTool);
         registry.register(ListSkillsTool);
         registry.register(ReadSkillTool);
+        registry.register(AddSkillTool);
         registry.register(ListMcpServersTool);
+        registry.register(AddMcpServerTool);
         registry.register(CallMcpTool);
         registry.register(McpResourceTool);
         registry.register(McpPromptTool);
@@ -307,6 +311,42 @@ fn array_of_strings_arg(args: &Value, key: &str) -> Result<Vec<String>> {
                 .ok_or_else(|| anyhow!("{key} 必须全部是字符串"))
         })
         .collect()
+}
+
+fn optional_string_array_arg(args: &Value, key: &str) -> Result<Vec<String>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("{key} 必须全部是字符串"))
+            })
+            .collect(),
+        Some(_) => anyhow::bail!("{key} 必须是字符串数组"),
+    }
+}
+
+fn optional_string_map_arg(
+    args: &Value,
+    key: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut output = std::collections::BTreeMap::new();
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(output),
+        Some(Value::Object(values)) => {
+            for (name, value) in values {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{key}.{name} 必须是字符串"))?;
+                output.insert(name.clone(), value.to_string());
+            }
+            Ok(output)
+        }
+        Some(_) => anyhow::bail!("{key} 必须是对象"),
+    }
 }
 
 fn resolve_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
@@ -1590,6 +1630,47 @@ impl Tool for ReadSkillTool {
     }
 }
 
+struct AddSkillTool;
+
+#[async_trait]
+impl Tool for AddSkillTool {
+    fn name(&self) -> &'static str {
+        "add_skill"
+    }
+    fn description(&self) -> &'static str {
+        "新增项目级或用户级 Skill，写入 .yunzhi/skills 或 ~/.yunzhi/skills"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "id":{"type":"string","description":"Skill id，可用 / 分组，例如 code/review"},
+                "description":{"type":"string","description":"Skill 简短描述"},
+                "content":{"type":"string","description":"Skill Markdown 正文"},
+                "scope":{"type":"string","enum":["project","user"],"description":"写入范围，默认 project"},
+                "overwrite":{"type":"boolean","description":"是否覆盖同名 Skill，默认 false"}
+            },
+            "required":["id","description","content"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let id = string_arg(&args, "id")?;
+        let description = string_arg(&args, "description")?;
+        let content = string_arg(&args, "content")?;
+        let scope = ExtensionScope::parse(
+            args.get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("project"),
+        )?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let path = add_skill(&context.cwd, scope, &id, &description, &content, overwrite)?;
+        Ok(ToolOutput::ok(format!("已添加 Skill: {}", path.display())))
+    }
+}
+
 struct ListMcpServersTool;
 
 #[async_trait]
@@ -1624,6 +1705,62 @@ impl Tool for ListMcpServersTool {
             .collect::<Vec<_>>()
             .join("\n");
         Ok(ToolOutput::ok(rendered))
+    }
+}
+
+struct AddMcpServerTool;
+
+#[async_trait]
+impl Tool for AddMcpServerTool {
+    fn name(&self) -> &'static str {
+        "add_mcp_server"
+    }
+    fn description(&self) -> &'static str {
+        "新增或覆盖项目级/用户级 MCP stdio server 配置"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "name":{"type":"string","description":"MCP server 名称"},
+                "command":{"type":"string","description":"启动 server 的命令"},
+                "args":{"type":"array","items":{"type":"string"},"description":"命令参数"},
+                "env":{"type":"object","additionalProperties":{"type":"string"},"description":"环境变量"},
+                "scope":{"type":"string","enum":["project","user"],"description":"写入范围，默认 project"},
+                "overwrite":{"type":"boolean","description":"是否覆盖同名 server，默认 false"}
+            },
+            "required":["name","command"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let name = string_arg(&args, "name")?;
+        let command = string_arg(&args, "command")?;
+        let server_args = optional_string_array_arg(&args, "args")?;
+        let env = optional_string_map_arg(&args, "env")?;
+        let scope = ExtensionScope::parse(
+            args.get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("project"),
+        )?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let path = add_mcp_server(
+            &context.cwd,
+            scope,
+            &name,
+            McpServerConfig {
+                command,
+                args: server_args,
+                env,
+            },
+            overwrite,
+        )?;
+        Ok(ToolOutput::ok(format!(
+            "已更新 MCP 配置: {}",
+            path.display()
+        )))
     }
 }
 
@@ -4854,6 +4991,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adds_skill_with_tool() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+
+        let output = registry
+            .execute(
+                "add_skill",
+                json!({
+                    "id":"code/review",
+                    "description":"Review helper",
+                    "content":"Use care."
+                }),
+                &mut ctx,
+            )
+            .await;
+
+        assert!(!output.is_error);
+        assert!(dir
+            .path()
+            .join(".yunzhi/skills/code/review/SKILL.md")
+            .exists());
+        let output = registry
+            .execute("read_skill", json!({"skill":"code/review"}), &mut ctx)
+            .await;
+        assert!(output.content.contains("Use care."));
+    }
+
+    #[tokio::test]
     async fn lists_mcp_servers() {
         let dir = tempdir().unwrap();
         let config_dir = dir.path().join(".yunzhi");
@@ -4871,6 +5037,33 @@ mod tests {
             .await;
         assert!(output.content.contains("demo"));
         assert!(output.content.contains("echo ok"));
+    }
+
+    #[tokio::test]
+    async fn adds_mcp_server_with_tool() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+
+        let output = registry
+            .execute(
+                "add_mcp_server",
+                json!({
+                    "name":"demo",
+                    "command":"node",
+                    "args":["server.js"],
+                    "env":{"TOKEN":"abc"}
+                }),
+                &mut ctx,
+            )
+            .await;
+
+        assert!(!output.is_error);
+        let output = registry
+            .execute("list_mcp_servers", json!({}), &mut ctx)
+            .await;
+        assert!(output.content.contains("demo"));
+        assert!(output.content.contains("node server.js"));
     }
 
     #[tokio::test]

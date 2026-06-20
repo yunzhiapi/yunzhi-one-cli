@@ -45,6 +45,11 @@ pub enum TuiEvent {
         success: bool,
         elapsed_secs: f32,
     },
+    ToolResult {
+        name: String,
+        content: String,
+        is_error: bool,
+    },
     Status {
         turn: TurnMetrics,
         session: UsageMetrics,
@@ -54,6 +59,7 @@ pub enum TuiEvent {
     Warning(String),
     Info(String),
     Error(String),
+    ModeChanged(AgentMode),
     Permission {
         request: PermissionRequest,
         respond: oneshot::Sender<PermissionDecision>,
@@ -188,6 +194,19 @@ pub fn print_tool_done(success: bool, elapsed_secs: f32) {
         "✗ 失败".red()
     };
     println!("└ {} ({:.1}s)\n", mark, elapsed_secs);
+}
+
+pub fn print_tool_result(name: &str, content: &str, is_error: bool) {
+    if emit_event(TuiEvent::ToolResult {
+        name: name.to_string(),
+        content: content.to_string(),
+        is_error,
+    }) {
+        return;
+    }
+    if name == "call_model" && !content.trim().is_empty() {
+        println!("{}\n", content.trim());
+    }
 }
 
 pub fn print_unverified_completion_warning() {
@@ -436,6 +455,7 @@ async fn agent_worker(
         agent.mode(),
         agent.model()
     )));
+    emit_event(TuiEvent::ModeChanged(agent.mode()));
     while let Some(command) = commands.recv().await {
         match command {
             AgentCommand::Shutdown => break,
@@ -450,6 +470,7 @@ async fn agent_worker(
             AgentCommand::SetMode(raw_mode) => match AgentMode::from_str(raw_mode.trim()) {
                 Ok(mode) => match agent.set_mode(mode) {
                     Ok(()) => {
+                        emit_event(TuiEvent::ModeChanged(agent.mode()));
                         emit_event(TuiEvent::Info(format!("已切换到 {} 模式。", agent.mode())));
                     }
                     Err(error) => {
@@ -506,6 +527,13 @@ struct FullscreenApp {
     status: String,
     busy: bool,
     pending: Option<PendingPrompt>,
+    pending_input: Vec<char>,
+    pending_cursor: usize,
+    pending_choice_index: usize,
+    mode: AgentMode,
+    team_columns: Vec<TeamColumn>,
+    active_team_column: Option<usize>,
+    last_team_tool_column: Option<usize>,
     output_area: Rect,
 }
 
@@ -524,6 +552,13 @@ impl FullscreenApp {
             status: format!("模式 agent | 模型 {DEFAULT_MODEL} | tokens 0 | $0.000000"),
             busy: false,
             pending: None,
+            pending_input: Vec::new(),
+            pending_cursor: 0,
+            pending_choice_index: 0,
+            mode: AgentMode::Agent,
+            team_columns: Vec::new(),
+            active_team_column: None,
+            last_team_tool_column: None,
             output_area: Rect::default(),
         }
     }
@@ -540,36 +575,11 @@ impl FullscreenApp {
             .split(area);
         self.output_area = chunks[0];
 
-        let output_items = self
-            .lines
-            .iter()
-            .flat_map(LogLine::to_items)
-            .collect::<Vec<_>>();
-        let visible_height = chunks[0].height.saturating_sub(2) as usize;
-        let max_scroll = output_items.len().saturating_sub(visible_height);
-        self.scroll = self.scroll.min(max_scroll);
-        let visible_end = output_items.len().saturating_sub(self.scroll);
-        let visible_start = visible_end.saturating_sub(visible_height);
-        let position = if self.scroll == 0 {
-            "底部".to_string()
+        if self.mode == AgentMode::Team && chunks[0].width >= 92 {
+            self.render_team_columns(frame, chunks[0]);
         } else {
-            format!("上移 {} 行", self.scroll)
-        };
-        let output_title = format!(
-            " 云智 One v{} | 输出 | {} | 滚轮/PageUp/PageDown ",
-            self.version, position
-        );
-        let output = List::new(
-            output_items
-                .into_iter()
-                .skip(visible_start)
-                .take(visible_end.saturating_sub(visible_start))
-                .collect::<Vec<_>>(),
-        )
-        .block(Block::default().title(output_title).borders(Borders::ALL))
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(Style::default().fg(Color::White));
-        frame.render_widget(output, chunks[0]);
+            self.render_output(frame, chunks[0]);
+        }
 
         let status = Paragraph::new(self.status.clone())
             .style(Style::default().bg(Color::Rgb(34, 40, 49)).fg(Color::White));
@@ -608,35 +618,157 @@ impl FullscreenApp {
             );
         }
 
-        if let Some(pending) = &self.pending {
-            let popup = centered_rect(78, 60, area);
-            frame.render_widget(Clear, popup);
-            let text = Text::from(pending.render_text());
+        if self.pending.is_some() {
+            self.render_pending_popup(frame, area);
+        }
+    }
+
+    fn render_output(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let output_items = self
+            .lines
+            .iter()
+            .flat_map(LogLine::to_items)
+            .collect::<Vec<_>>();
+        let visible_height = area.height.saturating_sub(2) as usize;
+        let max_scroll = output_items.len().saturating_sub(visible_height);
+        self.scroll = self.scroll.min(max_scroll);
+        let visible_end = output_items.len().saturating_sub(self.scroll);
+        let visible_start = visible_end.saturating_sub(visible_height);
+        let position = if self.scroll == 0 {
+            "底部".to_string()
+        } else {
+            format!("上移 {} 行", self.scroll)
+        };
+        let output_title = format!(
+            " 云智 One v{} | 输出 | {} | 滚轮/PageUp/PageDown ",
+            self.version, position
+        );
+        let output = List::new(
+            output_items
+                .into_iter()
+                .skip(visible_start)
+                .take(visible_end.saturating_sub(visible_start))
+                .collect::<Vec<_>>(),
+        )
+        .block(Block::default().title(output_title).borders(Borders::ALL))
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(Style::default().fg(Color::White));
+        frame.render_widget(output, area);
+    }
+
+    fn render_team_columns(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        if self.team_columns.is_empty() {
+            self.team_columns.push(TeamColumn::new("主控".to_string()));
+        }
+        let visible_count = self.team_columns.len().clamp(1, 4);
+        let constraints = (0..visible_count)
+            .map(|_| Constraint::Ratio(1, visible_count as u32))
+            .collect::<Vec<_>>();
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(area);
+        for (index, column_area) in columns.iter().enumerate() {
+            let column = &self.team_columns[index];
+            let status = match column.status {
+                TeamStatus::Waiting => "waiting",
+                TeamStatus::Running => "running",
+                TeamStatus::Done => "done",
+                TeamStatus::Failed => "failed",
+            };
+            let title = format!(" {} | {} ", column.title, status);
+            let items = column
+                .messages
+                .iter()
+                .rev()
+                .take(column_area.height.saturating_sub(2) as usize)
+                .rev()
+                .map(|message| ListItem::new(Line::from(message.clone())))
+                .collect::<Vec<_>>();
+            let border = if Some(index) == self.active_team_column {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            };
             frame.render_widget(
-                Paragraph::new(text)
-                    .style(Style::default().fg(Color::White))
+                List::new(items)
                     .block(
                         Block::default()
-                            .title(" 需要确认 ")
+                            .title(title)
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Yellow)),
+                            .border_style(Style::default().fg(border)),
                     )
-                    .wrap(Wrap { trim: false }),
-                popup,
+                    .style(Style::default().fg(Color::Gray)),
+                *column_area,
             );
         }
     }
 
+    fn render_pending_popup(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let popup = centered_rect(78, 66, area);
+        frame.render_widget(Clear, popup);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(popup);
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let title = pending.title();
+        let text = Text::from(pending.render_text(self.pending_choice_index));
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().fg(Color::White))
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                )
+                .wrap(Wrap { trim: false }),
+            chunks[0],
+        );
+        let input_title = match pending {
+            PendingPrompt::Choice { request, .. } if !request.allow_custom => {
+                " ↑↓ 选择，Enter 确认 "
+            }
+            PendingPrompt::Choice { .. } => " ↑↓ 选择，Enter 确认，也可输入自定义答案 ",
+            PendingPrompt::Ask { .. } => " 输入回答，Enter 确认 ",
+            PendingPrompt::Permission { .. } => {
+                " y 执行 / a 全部允许 / n 拒绝 / p 1,3-5 选择 diff 块 "
+            }
+        };
+        let input = Paragraph::new(self.pending_input_string())
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .title(input_title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(input, chunks[1]);
+        let x = chunks[1].x + 1 + self.pending_cursor as u16;
+        frame.set_cursor_position((x.min(chunks[1].right().saturating_sub(2)), chunks[1].y + 1));
+    }
+
     fn apply_event(&mut self, event: TuiEvent, command_tx: &mpsc::UnboundedSender<AgentCommand>) {
         match event {
-            TuiEvent::User(text) => self.push(LogLine::user(text)),
-            TuiEvent::AgentDelta(delta) => self.push_agent_delta(&delta),
+            TuiEvent::User(text) => {
+                self.push(LogLine::user(text.clone()));
+                self.push_team_message(0, &format!("> {text}"));
+            }
+            TuiEvent::AgentDelta(delta) => {
+                self.push_agent_delta(&delta);
+                self.push_team_message(0, &delta);
+            }
             TuiEvent::ToolStart { name, summary } => {
                 self.busy = true;
                 self.push(LogLine::tool(format!("调用工具 {name}")));
                 if !summary.is_empty() {
                     self.push(LogLine::dim(pretty_json_or_raw(&summary)));
                 }
+                self.start_team_tool(&name, &summary);
             }
             TuiEvent::ToolDone {
                 success,
@@ -647,6 +779,14 @@ impl FullscreenApp {
                     "{} ({elapsed_secs:.1}s)",
                     if success { "完成" } else { "失败" }
                 )));
+                self.finish_team_tool(success, elapsed_secs);
+            }
+            TuiEvent::ToolResult {
+                name,
+                content,
+                is_error,
+            } => {
+                self.push_team_tool_result(&name, &content, is_error);
             }
             TuiEvent::Status {
                 turn,
@@ -656,7 +796,8 @@ impl FullscreenApp {
             } => {
                 self.busy = false;
                 self.status = format!(
-                    "模型 {} | 本轮 {:.1}s req {} tokens {} ${:.6} | 会话 {:.1}s req {} tokens {} ${:.6} | 上下文 {}",
+                    "模式 {} | 模型 {} | 本轮 {:.1}s req {} tokens {} ${:.6} | 会话 {:.1}s req {} tokens {} ${:.6} | 上下文 {}",
+                    self.mode,
                     model,
                     turn.elapsed_ms as f32 / 1000.0,
                     turn.request_count,
@@ -676,17 +817,47 @@ impl FullscreenApp {
                 self.busy = false;
                 self.push(LogLine::error(message));
             }
+            TuiEvent::ModeChanged(mode) => {
+                self.mode = mode;
+                self.refresh_status_mode();
+                if mode == AgentMode::Team && self.team_columns.is_empty() {
+                    self.team_columns.push(TeamColumn::new("主控".to_string()));
+                    self.active_team_column = Some(0);
+                } else if mode != AgentMode::Team {
+                    self.team_columns.clear();
+                    self.active_team_column = None;
+                    self.last_team_tool_column = None;
+                }
+            }
             TuiEvent::Permission { request, respond } => {
-                self.pending = Some(PendingPrompt::Permission { request, respond });
+                self.set_pending(PendingPrompt::Permission { request, respond });
             }
             TuiEvent::AskUser { request, respond } => {
-                self.pending = Some(PendingPrompt::Ask { request, respond });
+                self.set_pending(PendingPrompt::Ask { request, respond });
             }
             TuiEvent::ChooseOption { request, respond } => {
-                self.pending = Some(PendingPrompt::Choice { request, respond });
+                self.set_pending(PendingPrompt::Choice { request, respond });
             }
         }
         let _ = command_tx;
+    }
+
+    fn set_pending(&mut self, pending: PendingPrompt) {
+        self.pending = Some(pending);
+        self.pending_input.clear();
+        self.pending_cursor = 0;
+        self.pending_choice_index = 0;
+    }
+
+    fn refresh_status_mode(&mut self) {
+        let Some(rest) = self.status.split_once('|').map(|(_, rest)| rest.trim()) else {
+            self.status = format!(
+                "模式 {} | 模型 {DEFAULT_MODEL} | tokens 0 | $0.000000",
+                self.mode
+            );
+            return;
+        };
+        self.status = format!("模式 {} | {rest}", self.mode);
     }
 
     fn submit_input(&mut self, command_tx: &mpsc::UnboundedSender<AgentCommand>) {
@@ -721,6 +892,7 @@ impl FullscreenApp {
             }
             _ => {
                 self.push(LogLine::user(input.clone()));
+                self.push_team_message(0, &format!("> {input}"));
                 self.busy = true;
                 let _ = command_tx.send(AgentCommand::Submit(input));
             }
@@ -731,6 +903,7 @@ impl FullscreenApp {
         match pending {
             PendingPrompt::Permission { request, respond } => {
                 let decision = match input.trim().to_ascii_lowercase().as_str() {
+                    "" => PermissionDecision::Allow,
                     "y" | "yes" => PermissionDecision::Allow,
                     "a" | "all" => PermissionDecision::AllowAll,
                     "n" | "no" => PermissionDecision::Deny,
@@ -769,6 +942,15 @@ impl FullscreenApp {
             }
             PendingPrompt::Choice { request, respond } => {
                 let answer = input.trim();
+                if answer.is_empty() {
+                    let index = self.pending_choice_index.min(request.options.len() - 1);
+                    let _ = respond.send(UserChoiceResponse {
+                        answer: request.options[index].clone(),
+                        index: Some(index),
+                        custom: false,
+                    });
+                    return;
+                }
                 if let Ok(choice) = answer.parse::<usize>() {
                     if (1..=request.options.len()).contains(&choice) {
                         let _ = respond.send(UserChoiceResponse {
@@ -792,6 +974,133 @@ impl FullscreenApp {
                     )));
                     self.pending = Some(PendingPrompt::Choice { request, respond });
                 }
+            }
+        }
+    }
+
+    fn submit_pending(&mut self) {
+        let input = self.pending_input_string();
+        self.pending_input.clear();
+        self.pending_cursor = 0;
+        if let Some(pending) = self.pending.take() {
+            self.answer_pending(pending, input);
+        }
+    }
+
+    fn pending_input_string(&self) -> String {
+        self.pending_input.iter().collect()
+    }
+
+    fn insert_pending_text(&mut self, text: &str) {
+        let inserted = text.chars().collect::<Vec<_>>();
+        let inserted_len = inserted.len();
+        self.pending_input
+            .splice(self.pending_cursor..self.pending_cursor, inserted);
+        self.pending_cursor += inserted_len;
+    }
+
+    fn move_pending_choice(&mut self, delta: isize) {
+        let Some(PendingPrompt::Choice { request, .. }) = &self.pending else {
+            return;
+        };
+        if request.options.is_empty() {
+            return;
+        }
+        let len = request.options.len() as isize;
+        self.pending_choice_index =
+            (self.pending_choice_index as isize + delta).rem_euclid(len) as usize;
+    }
+
+    fn push_team_message(&mut self, index: usize, text: &str) {
+        if self.mode != AgentMode::Team || text.trim().is_empty() {
+            return;
+        }
+        while self.team_columns.len() <= index {
+            self.team_columns.push(TeamColumn::new(format!(
+                "子智能体 {}",
+                self.team_columns.len()
+            )));
+        }
+        if let Some(column) = self.team_columns.get_mut(index) {
+            if matches!(column.messages.last_mut(), Some(last) if !last.ends_with('\n')) {
+                if let Some(last) = column.messages.last_mut() {
+                    last.push_str(text);
+                }
+            } else {
+                column.messages.push(text.to_string());
+            }
+            if column.messages.len() > 200 {
+                column.messages.drain(..50);
+            }
+        }
+    }
+
+    fn start_team_tool(&mut self, name: &str, summary: &str) {
+        if self.mode != AgentMode::Team {
+            return;
+        }
+        if self.team_columns.is_empty() {
+            self.team_columns.push(TeamColumn::new("主控".to_string()));
+        }
+        if name == "call_model" {
+            let title = team_column_title(summary)
+                .unwrap_or_else(|| format!("子智能体 {}", self.team_columns.len()));
+            let index = self.team_columns.len();
+            let mut column = TeamColumn::new(title);
+            column.status = TeamStatus::Running;
+            column.messages.push("开始处理子任务".to_string());
+            if let Some(prompt) = team_prompt_preview(summary) {
+                column.messages.push(prompt);
+            }
+            self.team_columns.push(column);
+            self.active_team_column = Some(index);
+            self.last_team_tool_column = Some(index);
+        } else {
+            self.active_team_column = Some(0);
+            self.last_team_tool_column = Some(0);
+            if let Some(column) = self.team_columns.get_mut(0) {
+                column.status = TeamStatus::Running;
+                column.messages.push(format!("调用工具 {name}"));
+            }
+        }
+    }
+
+    fn finish_team_tool(&mut self, success: bool, elapsed_secs: f32) {
+        if self.mode != AgentMode::Team {
+            return;
+        }
+        let Some(index) = self.active_team_column else {
+            return;
+        };
+        if let Some(column) = self.team_columns.get_mut(index) {
+            column.status = if success {
+                TeamStatus::Done
+            } else {
+                TeamStatus::Failed
+            };
+            column.messages.push(format!(
+                "{} ({elapsed_secs:.1}s)",
+                if success { "完成" } else { "失败" }
+            ));
+        }
+        self.active_team_column = Some(0);
+    }
+
+    fn push_team_tool_result(&mut self, name: &str, content: &str, is_error: bool) {
+        if self.mode != AgentMode::Team || name != "call_model" || content.trim().is_empty() {
+            return;
+        }
+        let index = self.last_team_tool_column.unwrap_or(0);
+        if let Some(column) = self.team_columns.get_mut(index) {
+            column.status = if is_error {
+                TeamStatus::Failed
+            } else {
+                TeamStatus::Done
+            };
+            column.messages.push("返回:".to_string());
+            column.messages.push(trim_team_result(content));
+            if column.messages.len() > 200 {
+                column.messages.drain(..50);
             }
         }
     }
@@ -910,6 +1219,34 @@ fn handle_key(
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
+    }
+    if app.pending.is_some() {
+        match key.code {
+            KeyCode::Enter => app.submit_pending(),
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.insert_pending_text("\n");
+            }
+            KeyCode::Char(ch) => app.insert_pending_text(&ch.to_string()),
+            KeyCode::Backspace => {
+                if app.pending_cursor > 0 {
+                    app.pending_cursor -= 1;
+                    app.pending_input.remove(app.pending_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if app.pending_cursor < app.pending_input.len() {
+                    app.pending_input.remove(app.pending_cursor);
+                }
+            }
+            KeyCode::Left => app.pending_cursor = app.pending_cursor.saturating_sub(1),
+            KeyCode::Right => {
+                app.pending_cursor = (app.pending_cursor + 1).min(app.pending_input.len())
+            }
+            KeyCode::Up => app.move_pending_choice(-1),
+            KeyCode::Down => app.move_pending_choice(1),
+            _ => {}
+        }
+        return Ok(false);
     }
     match key.code {
         KeyCode::Enter => app.submit_input(command_tx),
@@ -1094,12 +1431,44 @@ enum PendingPrompt {
     },
 }
 
+struct TeamColumn {
+    title: String,
+    status: TeamStatus,
+    messages: Vec<String>,
+}
+
+impl TeamColumn {
+    fn new(title: String) -> Self {
+        Self {
+            title,
+            status: TeamStatus::Waiting,
+            messages: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TeamStatus {
+    Waiting,
+    Running,
+    Done,
+    Failed,
+}
+
 impl PendingPrompt {
-    fn render_text(&self) -> String {
+    fn title(&self) -> &'static str {
+        match self {
+            PendingPrompt::Permission { .. } => " 需要确认 ",
+            PendingPrompt::Ask { .. } => " 需要输入 ",
+            PendingPrompt::Choice { .. } => " 请选择 ",
+        }
+    }
+
+    fn render_text(&self, selected_index: usize) -> String {
         match self {
             PendingPrompt::Permission { request, .. } => {
                 let mut text = format!(
-                    "{}\n{}\n\n输入 y 执行，a 全部允许，n 拒绝，p 1,3-5 选择 diff 块。",
+                    "{}\n{}\n\n下方输入 y 执行，a 全部允许，n 拒绝，p 1,3-5 选择 diff 块。",
                     request.tool_name, request.summary
                 );
                 if let Some(diff) = &request.diff {
@@ -1128,10 +1497,11 @@ impl PendingPrompt {
                 }
                 text.push_str(&request.question);
                 for (index, option) in request.options.iter().enumerate() {
-                    text.push_str(&format!("\n{}. {}", index + 1, option));
+                    let marker = if index == selected_index { ">" } else { " " };
+                    text.push_str(&format!("\n{marker} {}. {}", index + 1, option));
                 }
                 if request.allow_custom {
-                    text.push_str("\n也可以输入自定义答案。");
+                    text.push_str("\n\n也可以在下方输入自定义答案。");
                 }
                 text
             }
@@ -1304,6 +1674,35 @@ fn pretty_json_or_raw(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw)
         .and_then(|value| serde_json::to_string_pretty(&value))
         .unwrap_or_else(|_| raw.to_string())
+}
+
+fn team_column_title(summary: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(summary).ok()?;
+    let model = value.get("model").and_then(serde_json::Value::as_str)?;
+    Some(model.chars().take(24).collect())
+}
+
+fn team_prompt_preview(summary: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(summary).ok()?;
+    let prompt = value.get("prompt").and_then(serde_json::Value::as_str)?;
+    let preview = prompt
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(prompt)
+        .chars()
+        .take(120)
+        .collect::<String>();
+    Some(format!("任务: {preview}"))
+}
+
+fn trim_team_result(content: &str) -> String {
+    let trimmed = content.trim();
+    let preview = trimmed.chars().take(1200).collect::<String>();
+    if trimmed.chars().count() > 1200 {
+        format!("{preview}\n...")
+    } else {
+        preview
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
