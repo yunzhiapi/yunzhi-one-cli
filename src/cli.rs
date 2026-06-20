@@ -1,5 +1,7 @@
 use crate::agent::Agent;
-use crate::config::{ensure_config_interactive, load_config, masked_key, save_config};
+use crate::config::{
+    ensure_config_interactive, load_config, load_profile, masked_key, save_config,
+};
 use crate::llm::AnthropicLikeClient;
 use crate::tui::{self, StdoutPrompter};
 use crate::types::{AgentMode, AgentOptions, AppConfig};
@@ -23,6 +25,10 @@ pub struct Cli {
     /// 智能体模式：chat、plan-act、entanglement、agent、team、analyze
     #[arg(long, default_value_t = AgentMode::Agent)]
     pub mode: AgentMode,
+
+    /// 选择配置 Profile，读取 .yunzhi/profiles.toml 或 ~/.yunzhi/profiles.toml
+    #[arg(long)]
+    pub profile: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -60,14 +66,21 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 prompt,
                 cli.dangerously_skip_permissions,
                 mode.unwrap_or(cli.mode),
+                cli.profile,
             )
             .await
         }
         None => {
             if let Some(prompt) = cli.prompt {
-                run_print(prompt, cli.dangerously_skip_permissions, cli.mode).await
+                run_print(
+                    prompt,
+                    cli.dangerously_skip_permissions,
+                    cli.mode,
+                    cli.profile,
+                )
+                .await
             } else {
-                run_interactive(cli.dangerously_skip_permissions, cli.mode).await
+                run_interactive(cli.dangerously_skip_permissions, cli.mode, cli.profile).await
             }
         }
     }
@@ -92,17 +105,39 @@ fn run_config(command: ConfigCommand) -> Result<()> {
 async fn build_agent(
     dangerously_skip_permissions: bool,
     mode: AgentMode,
+    profile_name: Option<String>,
 ) -> Result<Agent<AnthropicLikeClient>> {
     let config = ensure_config_interactive()?;
+    let cwd = std::env::current_dir()?;
+    let profile = match profile_name.as_deref() {
+        Some(name) => Some(
+            load_profile(&cwd, name)?.ok_or_else(|| anyhow::anyhow!("未找到 profile: {name}"))?,
+        ),
+        None => None,
+    };
     let client = AnthropicLikeClient::new(config.api_key.clone());
-    let options = AgentOptions {
+    let mut options = AgentOptions {
         dangerously_skip_permissions,
         mode,
+        profile_name,
         ..AgentOptions::default()
     };
+    if let Some(profile) = profile {
+        if let Some(mode) = profile.mode {
+            options.mode = mode;
+        }
+        if let Some(model) = profile.model {
+            options.model = model;
+        }
+        if let Some(max_tokens) = profile.max_tokens {
+            options.max_tokens = max_tokens;
+        }
+        options.persona = profile.persona;
+        options.tool_allowlist = profile.tools;
+    }
     Agent::new(
         client,
-        std::env::current_dir()?,
+        cwd,
         config.api_key,
         options,
         Arc::new(StdoutPrompter),
@@ -113,16 +148,21 @@ async fn run_print(
     prompt: String,
     dangerously_skip_permissions: bool,
     mode: AgentMode,
+    profile: Option<String>,
 ) -> Result<()> {
-    let mut agent = build_agent(dangerously_skip_permissions, mode).await?;
+    let mut agent = build_agent(dangerously_skip_permissions, mode, profile).await?;
     agent.run_turn(prompt).await?;
     Ok(())
 }
 
-async fn run_interactive(dangerously_skip_permissions: bool, mode: AgentMode) -> Result<()> {
+async fn run_interactive(
+    dangerously_skip_permissions: bool,
+    mode: AgentMode,
+    profile: Option<String>,
+) -> Result<()> {
     tui::print_banner(env!("CARGO_PKG_VERSION"))?;
     println!("{}", tui::ratatui_plan());
-    let mut agent = build_agent(dangerously_skip_permissions, mode).await?;
+    let mut agent = build_agent(dangerously_skip_permissions, mode, profile).await?;
     println!("当前模式: {}。输入 /mode 查看或切换。\n", agent.mode());
     let mut editor = rustyline::DefaultEditor::new()?;
     let mut last_request: Option<String> = None;

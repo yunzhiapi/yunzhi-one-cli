@@ -1,8 +1,10 @@
-use crate::types::AppConfig;
+use crate::types::{AgentMode, AppConfig};
 use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("无法定位用户 home 目录")?;
@@ -15,6 +17,14 @@ pub fn config_path() -> Result<PathBuf> {
 
 pub fn memory_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".yunzhi").join("memory.md"))
+}
+
+pub fn global_profiles_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("profiles.toml"))
+}
+
+pub fn project_profiles_path(cwd: &Path) -> PathBuf {
+    cwd.join(".yunzhi").join("profiles.toml")
 }
 
 pub fn load_config() -> Result<Option<AppConfig>> {
@@ -39,6 +49,43 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
     let path = config_path()?;
     fs::write(&path, raw).with_context(|| format!("写入配置失败: {}", path.display()))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ProfilesFile {
+    #[serde(default)]
+    pub profiles: HashMap<String, ProfileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ProfileConfig {
+    pub persona: Option<String>,
+    pub mode: Option<AgentMode>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub tools: Option<Vec<String>>,
+}
+
+pub fn load_profile(cwd: &Path, name: &str) -> Result<Option<ProfileConfig>> {
+    let project_path = project_profiles_path(cwd);
+    if let Some(profile) =
+        read_profiles_file(&project_path)?.and_then(|file| file.profiles.get(name).cloned())
+    {
+        return Ok(Some(profile));
+    }
+    let global_path = global_profiles_path()?;
+    Ok(read_profiles_file(&global_path)?.and_then(|file| file.profiles.get(name).cloned()))
+}
+
+fn read_profiles_file(path: &Path) -> Result<Option<ProfilesFile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("读取 profile 配置失败: {}", path.display()))?;
+    let profiles = toml::from_str::<ProfilesFile>(&raw)
+        .with_context(|| format!("解析 profile 配置失败: {}", path.display()))?;
+    Ok(Some(profiles))
 }
 
 pub fn ensure_config_interactive() -> Result<AppConfig> {
@@ -98,5 +145,23 @@ mod tests {
     fn masks_key() {
         assert_eq!(masked_key("sk-1234567890"), "sk-1****7890");
         assert_eq!(masked_key("short"), "****");
+    }
+
+    #[test]
+    fn loads_project_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yunzhi")).unwrap();
+        std::fs::write(
+            dir.path().join(".yunzhi/profiles.toml"),
+            "[profiles.rust]\npersona = \"Rust reviewer\"\nmode = \"agent\"\nmodel = \"custom-model\"\nmax_tokens = 2048\ntools = [\"read_file\", \"test_loop\"]\n",
+        )
+        .unwrap();
+
+        let profile = load_profile(dir.path(), "rust").unwrap().unwrap();
+        assert_eq!(profile.persona.as_deref(), Some("Rust reviewer"));
+        assert_eq!(profile.mode, Some(AgentMode::Agent));
+        assert_eq!(profile.model.as_deref(), Some("custom-model"));
+        assert_eq!(profile.max_tokens, Some(2048));
+        assert_eq!(profile.tools.unwrap(), vec!["read_file", "test_loop"]);
     }
 }

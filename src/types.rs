@@ -145,6 +145,9 @@ pub struct AgentOptions {
     pub model: String,
     pub max_tokens: u32,
     pub mode: AgentMode,
+    pub profile_name: Option<String>,
+    pub persona: Option<String>,
+    pub tool_allowlist: Option<Vec<String>>,
 }
 
 impl Default for AgentOptions {
@@ -154,6 +157,9 @@ impl Default for AgentOptions {
             model: crate::llm::DEFAULT_MODEL.to_string(),
             max_tokens: 4096,
             mode: AgentMode::Agent,
+            profile_name: None,
+            persona: None,
+            tool_allowlist: None,
         }
     }
 }

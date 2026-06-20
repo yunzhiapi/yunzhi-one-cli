@@ -60,7 +60,7 @@ impl<C: LlmClient> Agent<C> {
         options: AgentOptions,
         prompter: Arc<dyn PermissionPrompter>,
     ) -> Result<Self> {
-        let system_prompt = build_system_prompt(options.mode)?;
+        let system_prompt = build_system_prompt(&options)?;
         let auto_approve = matches!(
             options.mode,
             AgentMode::Agent | AgentMode::PlanAct | AgentMode::Team | AgentMode::Entanglement
@@ -88,13 +88,13 @@ impl<C: LlmClient> Agent<C> {
 
     pub fn set_mode(&mut self, mode: AgentMode) -> Result<()> {
         self.options.mode = mode;
-        self.system_prompt = build_system_prompt(mode)?;
+        self.system_prompt = build_system_prompt(&self.options)?;
         self.pending_plan = None;
         Ok(())
     }
 
     fn refresh_system_prompt(&mut self) -> Result<()> {
-        self.system_prompt = build_system_prompt(self.options.mode)?;
+        self.system_prompt = build_system_prompt(&self.options)?;
         Ok(())
     }
 
@@ -139,11 +139,11 @@ impl<C: LlmClient> Agent<C> {
                 system: Some(self.system_prompt.clone()),
                 messages: self.history.clone(),
                 tools: if plan_act_planning {
-                    self.tools.definitions_for(PLAN_READ_ONLY_TOOLS)
+                    self.filtered_tool_definitions(PLAN_READ_ONLY_TOOLS)
                 } else if matches!(self.options.mode, AgentMode::Analyze) {
-                    self.tools.definitions_for(ANALYZE_READ_ONLY_TOOLS)
+                    self.filtered_tool_definitions(ANALYZE_READ_ONLY_TOOLS)
                 } else {
-                    self.tools.definitions()
+                    self.filtered_all_tool_definitions()
                 },
                 tool_choice: tool_choice.clone(),
             };
@@ -286,6 +286,28 @@ impl<C: LlmClient> Agent<C> {
         input
     }
 
+    fn filtered_all_tool_definitions(&self) -> Vec<crate::types::ToolDefinition> {
+        match self.options.tool_allowlist.as_deref() {
+            Some(allowlist) => {
+                let names = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+                self.tools.definitions_for(&names)
+            }
+            None => self.tools.definitions(),
+        }
+    }
+
+    fn filtered_tool_definitions(
+        &self,
+        default_names: &[&str],
+    ) -> Vec<crate::types::ToolDefinition> {
+        match self.options.tool_allowlist.as_deref() {
+            Some(allowlist) => self
+                .tools
+                .definitions_for(&filter_tool_names(default_names, allowlist)),
+            None => self.tools.definitions_for(default_names),
+        }
+    }
+
     fn compress_if_needed(&mut self) {
         if self.estimated_tokens() <= TOKEN_THRESHOLD || self.history.len() < 8 {
             return;
@@ -307,12 +329,24 @@ impl<C: LlmClient> Agent<C> {
     }
 }
 
-fn build_system_prompt(mode: AgentMode) -> Result<String> {
+fn build_system_prompt(options: &AgentOptions) -> Result<String> {
     let mut system_prompt = base_system_prompt();
     system_prompt.push_str("\n\n当前工作模式: ");
-    system_prompt.push_str(mode.as_str());
+    system_prompt.push_str(options.mode.as_str());
     system_prompt.push_str("\n");
-    system_prompt.push_str(mode_prompt(mode));
+    system_prompt.push_str(mode_prompt(options.mode));
+    if let Some(profile_name) = &options.profile_name {
+        system_prompt.push_str("\n\n当前 Profile: ");
+        system_prompt.push_str(profile_name);
+    }
+    if let Some(persona) = &options.persona {
+        system_prompt.push_str("\n\nProfile 人格/项目指令:\n");
+        system_prompt.push_str(persona);
+    }
+    if let Some(tools) = &options.tool_allowlist {
+        system_prompt.push_str("\n\nProfile 工具白名单: ");
+        system_prompt.push_str(&tools.join(", "));
+    }
     if let Some(memory) = load_project_memory()? {
         system_prompt.push_str("\n\n项目记忆 (.yunzhi/memory.md):\n");
         system_prompt.push_str(&memory);
@@ -324,6 +358,14 @@ fn build_system_prompt(mode: AgentMode) -> Result<String> {
             .push_str("\n需要使用某个 Skill 时，先调用 read_skill 读取完整说明，再按说明执行。");
     }
     Ok(system_prompt)
+}
+
+fn filter_tool_names<'a>(default_names: &[&'a str], allowlist: &[String]) -> Vec<&'a str> {
+    default_names
+        .iter()
+        .copied()
+        .filter(|name| allowlist.iter().any(|allowed| allowed == name))
+        .collect()
 }
 
 fn base_system_prompt() -> String {
@@ -583,5 +625,14 @@ mod tests {
         assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"execute_code"));
         assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"run_program"));
         assert!(!ANALYZE_READ_ONLY_TOOLS.contains(&"call_mcp_tool"));
+    }
+
+    #[test]
+    fn profile_allowlist_filters_read_only_tools() {
+        let allowlist = vec!["read_file".to_string(), "bash".to_string()];
+        assert_eq!(
+            filter_tool_names(PLAN_READ_ONLY_TOOLS, &allowlist),
+            vec!["read_file"]
+        );
     }
 }
