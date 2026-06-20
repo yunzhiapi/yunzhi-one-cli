@@ -197,6 +197,7 @@ impl ToolRegistry {
         registry.register(GlobSearchTool);
         registry.register(GrepSearchTool);
         registry.register(CodeIndexTool);
+        registry.register(GitManagerTool);
         registry.register(ListDirTool);
         registry.register(ListModelsTool);
         registry.register(ListSkillsTool);
@@ -1210,6 +1211,150 @@ impl Tool for CodeIndexTool {
         );
         output.push_str(&records.join("\n"));
         Ok(ToolOutput::ok(output.trim_end().to_string()))
+    }
+}
+
+struct GitManagerTool;
+
+#[async_trait]
+impl Tool for GitManagerTool {
+    fn name(&self) -> &'static str {
+        "git_manager"
+    }
+
+    fn description(&self) -> &'static str {
+        "Git 原生集成：查看状态和 diff、生成提交信息、创建分支、commit、push、打开 PR、返回 code review 所需 diff"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["status","diff","review_diff","message","create_branch","commit","push","open_pr"],"description":"要执行的 Git 动作"},
+                "paths":{"type":"array","items":{"type":"string"},"description":"可选，限制 diff/status/commit 的路径"},
+                "branch":{"type":"string","description":"create_branch 的分支名，或 push/open_pr 的当前分支提示"},
+                "message":{"type":"string","description":"commit message；commit 省略时会根据变更生成"},
+                "staged":{"type":"boolean","description":"diff/review_diff 是否查看暂存区，默认 false"},
+                "all":{"type":"boolean","description":"commit 时是否 git add -A 后提交，默认 true"},
+                "base":{"type":"string","description":"open_pr 的目标分支，可选"},
+                "title":{"type":"string","description":"open_pr 标题，可选"},
+                "body":{"type":"string","description":"open_pr 正文，可选"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+            },
+            "required":["action"]
+        })
+    }
+
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let action = string_arg(&args, "action")?;
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        let paths = array_of_strings_arg(&args, "paths")?;
+        match action.as_str() {
+            "status" => git_status(&context.cwd, &paths, timeout_secs).await,
+            "diff" => {
+                git_diff_tool(
+                    &context.cwd,
+                    &paths,
+                    bool_arg(&args, "staged", false),
+                    timeout_secs,
+                )
+                .await
+            }
+            "review_diff" => {
+                git_review_diff(
+                    &context.cwd,
+                    &paths,
+                    bool_arg(&args, "staged", false),
+                    timeout_secs,
+                )
+                .await
+            }
+            "message" => git_message(&context.cwd, &paths, timeout_secs).await,
+            "create_branch" => {
+                let branch = string_arg(&args, "branch")?;
+                confirm_git_action(context, self.name(), format!("创建并切换分支: {branch}"))
+                    .await?;
+                run_command(
+                    vec![
+                        "git".to_string(),
+                        "switch".to_string(),
+                        "-c".to_string(),
+                        branch,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            "commit" => {
+                let add_all = bool_arg(&args, "all", true);
+                let message = match optional_string_arg(&args, "message") {
+                    Some(message) => message,
+                    None => generate_commit_message(&context.cwd, &paths, timeout_secs).await?,
+                };
+                confirm_git_action(context, self.name(), format!("提交 Git 变更: {message}"))
+                    .await?;
+                let mut rendered = String::new();
+                if add_all {
+                    let add_output = git_add(&context.cwd, &paths, timeout_secs).await?;
+                    rendered.push_str(&add_output.content);
+                    rendered.push('\n');
+                }
+                let commit_output = run_command(
+                    vec![
+                        "git".to_string(),
+                        "commit".to_string(),
+                        "-m".to_string(),
+                        message,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await?;
+                rendered.push_str(&commit_output.content);
+                Ok(ToolOutput {
+                    content: rendered,
+                    is_error: commit_output.is_error,
+                })
+            }
+            "push" => {
+                let branch = optional_string_arg(&args, "branch");
+                confirm_git_action(context, self.name(), "推送当前 Git 分支".to_string()).await?;
+                let command = if let Some(branch) = branch {
+                    vec![
+                        "git".to_string(),
+                        "push".to_string(),
+                        "-u".to_string(),
+                        "origin".to_string(),
+                        branch,
+                    ]
+                } else {
+                    vec!["git".to_string(), "push".to_string()]
+                };
+                run_command(command, &context.cwd, timeout_secs).await
+            }
+            "open_pr" => {
+                confirm_git_action(context, self.name(), "创建 GitHub Pull Request".to_string())
+                    .await?;
+                let mut command = vec![
+                    "gh".to_string(),
+                    "pr".to_string(),
+                    "create".to_string(),
+                    "--fill".to_string(),
+                ];
+                if let Some(base) = optional_string_arg(&args, "base") {
+                    command.extend(["--base".to_string(), base]);
+                }
+                if let Some(title) = optional_string_arg(&args, "title") {
+                    command.extend(["--title".to_string(), title]);
+                }
+                if let Some(body) = optional_string_arg(&args, "body") {
+                    command.extend(["--body".to_string(), body]);
+                }
+                run_command(command, &context.cwd, timeout_secs).await
+            }
+            _ => anyhow::bail!("不支持的 Git 动作: {action}"),
+        }
     }
 }
 
@@ -3685,6 +3830,160 @@ fn copy_workspace_for_sandbox(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn confirm_git_action(
+    context: &mut ToolContext,
+    tool_name: &str,
+    summary: String,
+) -> Result<PermissionDecision> {
+    context
+        .confirm(PermissionRequest {
+            tool_name: tool_name.to_string(),
+            summary,
+            diff: None,
+        })
+        .await
+}
+
+async fn git_status(cwd: &Path, paths: &[String], timeout_secs: u64) -> Result<ToolOutput> {
+    let mut command = vec![
+        "git".to_string(),
+        "status".to_string(),
+        "--short".to_string(),
+    ];
+    append_git_paths(&mut command, paths);
+    let output = run_command(command, cwd, timeout_secs).await?;
+    if output.content.trim().is_empty() {
+        return Ok(ToolOutput::ok("工作区干净"));
+    }
+    Ok(output)
+}
+
+async fn git_diff_tool(
+    cwd: &Path,
+    paths: &[String],
+    staged: bool,
+    timeout_secs: u64,
+) -> Result<ToolOutput> {
+    let mut command = vec!["git".to_string(), "diff".to_string()];
+    if staged {
+        command.push("--staged".to_string());
+    }
+    append_git_paths(&mut command, paths);
+    run_command(command, cwd, timeout_secs).await
+}
+
+async fn git_review_diff(
+    cwd: &Path,
+    paths: &[String],
+    staged: bool,
+    timeout_secs: u64,
+) -> Result<ToolOutput> {
+    let status = git_status(cwd, paths, timeout_secs).await?;
+    let diff = git_diff_tool(cwd, paths, staged, timeout_secs).await?;
+    Ok(ToolOutput {
+        content: format!(
+            "code_review_context:\nstatus:\n{}\n\ndiff:\n{}",
+            status.content,
+            truncate_text(&diff.content, 30_000)
+        ),
+        is_error: status.is_error || diff.is_error,
+    })
+}
+
+async fn git_message(cwd: &Path, paths: &[String], timeout_secs: u64) -> Result<ToolOutput> {
+    let message = generate_commit_message(cwd, paths, timeout_secs).await?;
+    Ok(ToolOutput::ok(message))
+}
+
+async fn generate_commit_message(
+    cwd: &Path,
+    paths: &[String],
+    timeout_secs: u64,
+) -> Result<String> {
+    let mut command = vec![
+        "git".to_string(),
+        "status".to_string(),
+        "--short".to_string(),
+    ];
+    append_git_paths(&mut command, paths);
+    let output = run_command(command, cwd, timeout_secs).await?;
+    let mut added = 0usize;
+    let mut modified = 0usize;
+    let mut deleted = 0usize;
+    let mut renamed = 0usize;
+    let mut files = Vec::new();
+    for status_line in git_status_lines(&output.content) {
+        let code = &status_line[..2];
+        let file = status_line[3..].trim().to_string();
+        if code.contains('A') || code.contains('?') {
+            added += 1;
+        } else if code.contains('D') {
+            deleted += 1;
+        } else if code.contains('R') {
+            renamed += 1;
+        } else {
+            modified += 1;
+        }
+        files.push(file);
+    }
+    if files.is_empty() {
+        return Ok("Update project files".to_string());
+    }
+    let verb = if added > 0 && modified == 0 && deleted == 0 && renamed == 0 {
+        "Add"
+    } else if deleted > 0 && added == 0 && modified == 0 && renamed == 0 {
+        "Remove"
+    } else if renamed > 0 && added == 0 && modified == 0 && deleted == 0 {
+        "Rename"
+    } else {
+        "Update"
+    };
+    let subject = if files.len() == 1 {
+        humanize_file_for_commit(&files[0])
+    } else {
+        format!("{} files", files.len())
+    };
+    Ok(format!("{verb} {subject}"))
+}
+
+async fn git_add(cwd: &Path, paths: &[String], timeout_secs: u64) -> Result<ToolOutput> {
+    let mut command = vec!["git".to_string(), "add".to_string()];
+    if paths.is_empty() {
+        command.push("-A".to_string());
+    } else {
+        append_git_paths(&mut command, paths);
+    }
+    run_command(command, cwd, timeout_secs).await
+}
+
+fn append_git_paths(command: &mut Vec<String>, paths: &[String]) {
+    if !paths.is_empty() {
+        command.push("--".to_string());
+        command.extend(paths.iter().cloned());
+    }
+}
+
+fn humanize_file_for_commit(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(path)
+        .replace(['_', '-'], " ")
+}
+
+fn git_status_lines(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| {
+            line.len() >= 4
+                && !line.starts_with("command:")
+                && !line.starts_with("exit:")
+                && !line.starts_with("stdout:")
+                && !line.starts_with("stderr:")
+        })
+        .collect()
+}
+
 fn parse_todo_status(raw: &str) -> Result<TodoStatus> {
     match raw {
         "pending" => Ok(TodoStatus::Pending),
@@ -4008,6 +4307,58 @@ mod tests {
             std::fs::read_to_string(dir.path().join("original.txt")).unwrap(),
             "changed"
         );
+    }
+
+    #[tokio::test]
+    async fn git_manager_reports_status_diff_and_message() {
+        let dir = tempdir().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("feature.rs"), "fn old() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "feature.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "Add feature"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("feature.rs"), "fn new() {}\n").unwrap();
+
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let status = registry
+            .execute("git_manager", json!({"action":"status"}), &mut ctx)
+            .await;
+        assert!(!status.is_error, "{}", status.content);
+        assert!(status.content.contains("feature.rs"));
+
+        let diff = registry
+            .execute("git_manager", json!({"action":"diff"}), &mut ctx)
+            .await;
+        assert!(!diff.is_error, "{}", diff.content);
+        assert!(diff.content.contains("fn old"));
+
+        let message = registry
+            .execute("git_manager", json!({"action":"message"}), &mut ctx)
+            .await;
+        assert!(!message.is_error, "{}", message.content);
+        assert_eq!(message.content, "Update feature");
     }
 
     #[tokio::test]
