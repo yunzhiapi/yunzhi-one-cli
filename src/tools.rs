@@ -209,6 +209,7 @@ impl ToolRegistry {
         registry.register(ChooseOptionTool);
         registry.register(ExecuteCodeTool);
         registry.register(RunProgramTool);
+        registry.register(TestLoopTool);
         registry.register(ManageTodosTool);
         registry.register(SystemControlTool);
         registry.register(CreatePresentationTool);
@@ -1239,7 +1240,7 @@ impl Tool for GitManagerTool {
                 "base":{"type":"string","description":"open_pr 的目标分支，可选"},
                 "title":{"type":"string","description":"open_pr 标题，可选"},
                 "body":{"type":"string","description":"open_pr 正文，可选"},
-                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 60"}
             },
             "required":["action"]
         })
@@ -1790,6 +1791,78 @@ impl Tool for RunProgramTool {
             })
             .await?;
         run_command(command, &context.cwd, timeout_secs).await
+    }
+}
+
+struct TestLoopTool;
+
+#[async_trait]
+impl Tool for TestLoopTool {
+    fn name(&self) -> &'static str {
+        "test_loop"
+    }
+
+    fn description(&self) -> &'static str {
+        "运行项目测试命令并返回可用于自动修复循环的失败摘要；未提供 command 时自动探测 cargo/npm/pytest 等命令"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "command":{"type":"string","description":"可选测试命令；省略时自动探测"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 120"},
+                "sandbox":{"type":"boolean","description":"是否在临时工作区副本中执行，默认 true"},
+                "max_attempts":{"type":"integer","description":"本工具内部重复运行次数，默认 1；自动修复由 agent 根据失败输出继续编辑并再次调用"}
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let command = match optional_string_arg(&args, "command") {
+            Some(command) if !command.trim().is_empty() => command,
+            _ => detect_test_command(&context.cwd)?,
+        };
+        let timeout_secs = optional_u64_arg(&args, "timeout", 120).clamp(1, 1800);
+        let sandbox = bool_arg(&args, "sandbox", true);
+        let max_attempts = optional_u64_arg(&args, "max_attempts", 1).clamp(1, 10);
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!(
+                    "运行测试{}: {command}",
+                    if sandbox {
+                        "（沙箱）"
+                    } else {
+                        "（当前工作区）"
+                    }
+                ),
+                diff: None,
+            })
+            .await?;
+
+        let mut attempts = Vec::new();
+        let mut is_error = true;
+        for attempt in 1..=max_attempts {
+            let output = run_shell_command(&command, &context.cwd, timeout_secs, sandbox).await?;
+            is_error = output.is_error;
+            attempts.push(format!(
+                "attempt {attempt}/{max_attempts}\n{}",
+                format_test_output(&output.content)
+            ));
+            if !is_error {
+                break;
+            }
+        }
+
+        let status = if is_error { "failed" } else { "passed" };
+        Ok(ToolOutput {
+            content: format!(
+                "test_status: {status}\ncommand: {command}\n\n{}",
+                attempts.join("\n\n")
+            ),
+            is_error,
+        })
     }
 }
 
@@ -3971,6 +4044,54 @@ fn humanize_file_for_commit(path: &str) -> String {
         .replace(['_', '-'], " ")
 }
 
+fn detect_test_command(cwd: &Path) -> Result<String> {
+    if cwd.join("Cargo.toml").exists() {
+        return Ok("cargo test".to_string());
+    }
+    if cwd.join("package.json").exists() {
+        return Ok("npm test".to_string());
+    }
+    if cwd.join("pnpm-lock.yaml").exists() {
+        return Ok("pnpm test".to_string());
+    }
+    if cwd.join("yarn.lock").exists() {
+        return Ok("yarn test".to_string());
+    }
+    if cwd.join("pyproject.toml").exists()
+        || cwd.join("pytest.ini").exists()
+        || cwd.join("tox.ini").exists()
+    {
+        return Ok("pytest".to_string());
+    }
+    if cwd.join("go.mod").exists() {
+        return Ok("go test ./...".to_string());
+    }
+    anyhow::bail!("无法自动探测测试命令，请提供 command 参数")
+}
+
+fn format_test_output(output: &str) -> String {
+    let failure_lines = output
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("failed")
+                || lower.contains("error")
+                || lower.contains("panic")
+                || lower.contains("assert")
+                || lower.contains("failure")
+                || lower.contains("test result")
+                || lower.contains("running")
+                || lower.contains("exit:")
+        })
+        .take(120)
+        .collect::<Vec<_>>();
+    if failure_lines.is_empty() {
+        truncate_text(output, 12_000)
+    } else {
+        failure_lines.join("\n")
+    }
+}
+
 fn git_status_lines(output: &str) -> Vec<&str> {
     output
         .lines()
@@ -4359,6 +4480,30 @@ mod tests {
             .await;
         assert!(!message.is_error, "{}", message.content);
         assert_eq!(message.content, "Update feature");
+    }
+
+    #[test]
+    fn detects_cargo_test_command() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        assert_eq!(detect_test_command(dir.path()).unwrap(), "cargo test");
+    }
+
+    #[tokio::test]
+    async fn test_loop_reports_failed_command() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "test_loop",
+                json!({"command":"printf 'error: boom\n' >&2; exit 1","timeout":5}),
+                &mut ctx,
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("test_status: failed"));
+        assert!(output.content.contains("error: boom"));
     }
 
     #[tokio::test]
