@@ -1,1 +1,0 @@
-在这个目录下/home/mrcwoods/code/yunzhi-one-cli/，创建一个test.txt的文本，里面写入test。
