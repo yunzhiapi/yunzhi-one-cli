@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -142,6 +144,7 @@ pub struct AgentOptions {
     pub dangerously_skip_permissions: bool,
     pub model: String,
     pub max_tokens: u32,
+    pub mode: AgentMode,
 }
 
 impl Default for AgentOptions {
@@ -150,6 +153,89 @@ impl Default for AgentOptions {
             dangerously_skip_permissions: false,
             model: crate::llm::DEFAULT_MODEL.to_string(),
             max_tokens: 4096,
+            mode: AgentMode::Agent,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentMode {
+    Chat,
+    PlanAct,
+    Entanglement,
+    Agent,
+    Team,
+    Analyze,
+}
+
+impl AgentMode {
+    pub const ALL: [Self; 6] = [
+        Self::Chat,
+        Self::PlanAct,
+        Self::Entanglement,
+        Self::Agent,
+        Self::Team,
+        Self::Analyze,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::PlanAct => "plan-act",
+            Self::Entanglement => "entanglement",
+            Self::Agent => "agent",
+            Self::Team => "team",
+            Self::Analyze => "analyze",
+        }
+    }
+}
+
+impl fmt::Display for AgentMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AgentMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "chat" => Ok(Self::Chat),
+            "plan-act" | "plan&act" | "plan_act" | "planact" => Ok(Self::PlanAct),
+            "entanglement" => Ok(Self::Entanglement),
+            "agent" => Ok(Self::Agent),
+            "team" => Ok(Self::Team),
+            "analyze" | "analyse" => Ok(Self::Analyze),
+            _ => Err(format!(
+                "未知模式: {raw}。可选: {}",
+                Self::ALL
+                    .iter()
+                    .map(|mode| mode.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agent_modes() {
+        assert_eq!("chat".parse::<AgentMode>().unwrap(), AgentMode::Chat);
+        assert_eq!("plan&act".parse::<AgentMode>().unwrap(), AgentMode::PlanAct);
+        assert_eq!("plan_act".parse::<AgentMode>().unwrap(), AgentMode::PlanAct);
+        assert_eq!("team".parse::<AgentMode>().unwrap(), AgentMode::Team);
+        assert!("unknown".parse::<AgentMode>().is_err());
+    }
+
+    #[test]
+    fn displays_kebab_case_modes() {
+        assert_eq!(AgentMode::PlanAct.to_string(), "plan-act");
+        assert_eq!(AgentMode::Entanglement.to_string(), "entanglement");
     }
 }

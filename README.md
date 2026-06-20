@@ -32,6 +32,8 @@ cargo run -- config show
 cargo run -- config set-key sk-xxxx
 cargo run -- -p "阅读 README 并总结项目"
 cargo run -- print "列出当前目录文件"
+cargo run -- --mode plan-act -p "实现一个小功能并验证"
+cargo run -- print --mode analyze "分析当前项目结构"
 cargo run -- --dangerously-skip-permissions -p "运行 cargo test"
 ```
 
@@ -46,6 +48,8 @@ yunzhi
 
 - 主模型固定为 `Claude-Opus-4.6`，请求固定发送到 `https://yunzhiapi.cn/v1/chat/completions`。
 - 支持 chat-completions 风格 `stream: true` SSE 流式响应解析。
+- 支持 `--mode` 选择智能体模式，交互中也可以用 `/mode` 查看和切换。
+- 内置模式：`chat`、`plan-act`、`entanglement`、`agent`、`team`、`analyze`。
 - 预留 `LlmClient` trait，真实接口格式变化时可替换适配层。
 - 支持 `read_file`、`write_file`、`edit_file`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`manage_todos`、`system_control`、`call_model`。
 - 主模型可以通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
@@ -54,7 +58,16 @@ yunzhi
 - `system_control` 提供受控系统操作：查看工作目录、环境变量、进程列表、磁盘信息和终止进程。
 - 启动时读取项目级 `.yunzhi/memory.md` 并注入 system prompt。
 - 对话历史保存在内存中，超过阈值后做简单摘要压缩。
-- 交互模式支持 `/help`、`/clear`、`/exit`。
+- 交互模式支持 `/help`、`/mode`、`/clear`、`/exit`。
+
+## 智能体模式
+
+- `chat`：问答、解释和轻量建议优先，默认更克制地使用会改变环境的工具。
+- `plan-act`：先规划再执行，适合需要分步实现和验证的任务。
+- `entanglement`：强调上下文联动和交叉检查，适合复杂问题拆解。
+- `agent`：默认自主开发模式，需求清楚时直接读写、运行和验证。
+- `team`：用架构、实现、测试、审查等角色视角协作推进，并可委派其他模型。
+- `analyze`：只读分析、定位风险和比较方案优先，适合评审和排查。
 
 ## 设计取舍
 

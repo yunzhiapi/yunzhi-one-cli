@@ -1,4 +1,5 @@
 use crate::tools::{PermissionDecision, PermissionPrompter, PermissionRequest};
+use crate::types::AgentMode;
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -17,8 +18,20 @@ pub fn print_help() {
     println!("可用命令:");
     println!("  /help   显示帮助");
     println!("  /clear  清空当前对话上下文");
+    println!("  /mode   查看可选模式");
+    println!("  /mode <模式>  切换模式");
     println!("  /exit   退出");
     println!("快捷键: Ctrl+C 中断当前输入，Ctrl+D 退出。\n");
+}
+
+pub fn print_modes(current: AgentMode) {
+    println!("当前模式: {}", current);
+    println!("可选模式:");
+    for mode in AgentMode::ALL {
+        let marker = if mode == current { "*" } else { " " };
+        println!("  {} {}", marker, mode);
+    }
+    println!("\n用法: /mode chat 或 yunzhi --mode plan-act\n");
 }
 
 pub fn print_user(text: &str) {
