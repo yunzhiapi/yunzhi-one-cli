@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(long)]
     pub profile: Option<String>,
 
+    /// 覆盖本次运行使用的主控模型
+    #[arg(long)]
+    pub model: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -45,6 +49,9 @@ pub enum Commands {
         /// 智能体模式：chat、plan-act、entanglement、agent、team、analyze
         #[arg(long)]
         mode: Option<AgentMode>,
+        /// 覆盖本次 print 使用的主控模型
+        #[arg(long)]
+        model: Option<String>,
         prompt: String,
     },
     /// 以 MCP stdio server 模式运行，供 IDE 插件等 MCP client 调用
@@ -55,6 +62,8 @@ pub enum Commands {
 pub enum ConfigCommand {
     /// 设置 API Key
     SetKey { key: String },
+    /// 设置默认主控模型
+    SetModel { model: String },
     /// 查看当前配置，API Key 会做掩码显示
     Show,
 }
@@ -62,12 +71,17 @@ pub enum ConfigCommand {
 pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Commands::Config { command }) => run_config(command),
-        Some(Commands::Print { mode, prompt }) => {
+        Some(Commands::Print {
+            mode,
+            model,
+            prompt,
+        }) => {
             run_print(
                 prompt,
                 cli.dangerously_skip_permissions,
                 mode.unwrap_or(cli.mode),
                 cli.profile,
+                model.or(cli.model),
             )
             .await
         }
@@ -79,10 +93,17 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     cli.dangerously_skip_permissions,
                     cli.mode,
                     cli.profile,
+                    cli.model,
                 )
                 .await
             } else {
-                run_interactive(cli.dangerously_skip_permissions, cli.mode, cli.profile).await
+                run_interactive(
+                    cli.dangerously_skip_permissions,
+                    cli.mode,
+                    cli.profile,
+                    cli.model,
+                )
+                .await
             }
         }
     }
@@ -105,11 +126,31 @@ fn load_runtime_config(profile_name: Option<String>) -> Result<AppConfig> {
 fn run_config(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::SetKey { key } => {
-            save_config(&AppConfig { api_key: key })?;
+            let model = load_config()?.and_then(|config| config.model);
+            save_config(&AppConfig {
+                api_key: key,
+                model,
+            })?;
             println!("API Key 已保存。");
         }
+        ConfigCommand::SetModel { model } => {
+            let mut config = load_config()?.ok_or_else(|| {
+                anyhow::anyhow!("尚未配置 API Key。请先运行 yunzhi config set-key <key>")
+            })?;
+            let model = model.trim().to_string();
+            anyhow::ensure!(!model.is_empty(), "模型名称不能为空");
+            config.model = Some(model.clone());
+            save_config(&config)?;
+            println!("默认主控模型已设置为 {model}。");
+        }
         ConfigCommand::Show => match load_config()? {
-            Some(config) => println!("api_key = \"{}\"", masked_key(&config.api_key)),
+            Some(config) => {
+                println!("api_key = \"{}\"", masked_key(&config.api_key));
+                println!(
+                    "model = \"{}\"",
+                    config.model.as_deref().unwrap_or(crate::llm::DEFAULT_MODEL)
+                );
+            }
             None => println!(
                 "尚未配置 API Key。运行 yunzhi config set-key <key> 或直接启动 yunzhi 进入引导。"
             ),
@@ -122,6 +163,7 @@ async fn build_agent(
     dangerously_skip_permissions: bool,
     mode: AgentMode,
     profile_name: Option<String>,
+    model_override: Option<String>,
     fullscreen: bool,
 ) -> Result<Agent<AnthropicLikeClient>> {
     let config = ensure_config_interactive()?;
@@ -136,6 +178,10 @@ async fn build_agent(
     let mut options = AgentOptions {
         dangerously_skip_permissions,
         mode,
+        model: config
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::llm::DEFAULT_MODEL.to_string()),
         profile_name,
         ..AgentOptions::default()
     };
@@ -151,6 +197,11 @@ async fn build_agent(
         }
         options.persona = profile.persona;
         options.tool_allowlist = profile.tools;
+    }
+    if let Some(model) = model_override {
+        let model = model.trim().to_string();
+        anyhow::ensure!(!model.is_empty(), "模型名称不能为空");
+        options.model = model;
     }
     Agent::new(
         client,
@@ -170,8 +221,9 @@ async fn run_print(
     dangerously_skip_permissions: bool,
     mode: AgentMode,
     profile: Option<String>,
+    model: Option<String>,
 ) -> Result<()> {
-    let mut agent = build_agent(dangerously_skip_permissions, mode, profile, false).await?;
+    let mut agent = build_agent(dangerously_skip_permissions, mode, profile, model, false).await?;
     agent.run_turn(prompt).await?;
     Ok(())
 }
@@ -180,7 +232,8 @@ async fn run_interactive(
     dangerously_skip_permissions: bool,
     mode: AgentMode,
     profile: Option<String>,
+    model: Option<String>,
 ) -> Result<()> {
-    let agent = build_agent(dangerously_skip_permissions, mode, profile, true).await?;
+    let agent = build_agent(dangerously_skip_permissions, mode, profile, model, true).await?;
     tui::run_fullscreen(agent, env!("CARGO_PKG_VERSION")).await
 }

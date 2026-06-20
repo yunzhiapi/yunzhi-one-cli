@@ -100,7 +100,10 @@ pub fn ensure_config_interactive() -> Result<AppConfig> {
     io::stdin().read_line(&mut api_key)?;
     let api_key = api_key.trim().to_string();
     anyhow::ensure!(!api_key.is_empty(), "API Key 不能为空");
-    let config = AppConfig { api_key };
+    let config = AppConfig {
+        api_key,
+        model: Some(crate::llm::DEFAULT_MODEL.to_string()),
+    };
     save_config(&config)?;
     println!("已保存到 {}", config_path()?.display());
     Ok(config)
@@ -145,6 +148,13 @@ mod tests {
     fn masks_key() {
         assert_eq!(masked_key("sk-1234567890"), "sk-1****7890");
         assert_eq!(masked_key("short"), "****");
+    }
+
+    #[test]
+    fn loads_config_without_model() {
+        let config = toml::from_str::<AppConfig>("api_key = \"sk-test\"\n").unwrap();
+        assert_eq!(config.api_key, "sk-test");
+        assert_eq!(config.model, None);
     }
 
     #[test]

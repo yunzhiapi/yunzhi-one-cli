@@ -1755,7 +1755,7 @@ impl Tool for CallModelTool {
         json!({
             "type":"object",
             "properties":{
-                "model":{"type":"string","description":"要调用的模型名称，不能是主模型 Gemini-3.5-Flash 时用于委托其他模型"},
+                "model":{"type":"string","description":"要调用的模型名称，用于委托非当前主控模型完成子任务"},
                 "prompt":{"type":"string","description":"发送给目标模型的任务内容"},
                 "system":{"type":"string","description":"可选 system 指令"},
                 "max_tokens":{"type":"integer","description":"最大输出 token，默认 2048"}
@@ -2979,7 +2979,7 @@ impl Tool for UiDesignTool {
         let client = ChatCompletionsClient::new(context.api_key.clone());
         let response = client
             .complete_once(
-                "Gemini-3.5-Flash",
+                crate::llm::DEFAULT_MODEL,
                 Some("你是资深产品设计师和前端架构师。"),
                 &prompt,
                 4096,

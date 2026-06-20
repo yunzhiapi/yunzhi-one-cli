@@ -1,5 +1,6 @@
 use crate::agent::Agent;
 use crate::llm::AnthropicLikeClient;
+use crate::llm::DEFAULT_MODEL;
 use crate::observability::{TurnMetrics, UsageMetrics};
 use crate::tools::{
     PermissionDecision, PermissionPrompter, PermissionRequest, UserChoiceRequest,
@@ -46,6 +47,7 @@ pub enum TuiEvent {
         turn: TurnMetrics,
         session: UsageMetrics,
         context_tokens: usize,
+        model: String,
     },
     Warning(String),
     Info(String),
@@ -128,17 +130,24 @@ pub fn print_agent_delta(text: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn print_agent_done(turn: TurnMetrics, session: UsageMetrics, context_tokens: usize) {
+pub fn print_agent_done(
+    turn: TurnMetrics,
+    session: UsageMetrics,
+    context_tokens: usize,
+    model: &str,
+) {
     if emit_event(TuiEvent::Status {
         turn,
         session,
         context_tokens,
+        model: model.to_string(),
     }) {
         return;
     }
     println!(
-        "\n{} 本轮 {:.1}s | req {} | tokens {} | ${:.6} | 会话 {:.1}s | req {} | tokens {} | ${:.6} | 上下文 {}\n",
+        "\n{} 模型 {} | 本轮 {:.1}s | req {} | tokens {} | ${:.6} | 会话 {:.1}s | req {} | tokens {} | ${:.6} | 上下文 {}\n",
         "状态".dark_grey(),
+        model,
         turn.elapsed_ms as f32 / 1000.0,
         turn.request_count,
         turn.total_tokens(),
@@ -405,6 +414,7 @@ enum AgentCommand {
     Submit(String),
     Clear,
     SetMode(String),
+    SetModel(String),
     Session(String),
     Shutdown,
 }
@@ -414,7 +424,11 @@ async fn agent_worker(
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
 ) {
     let mut last_request: Option<String> = None;
-    emit_event(TuiEvent::Info(format!("当前模式: {}", agent.mode())));
+    emit_event(TuiEvent::Info(format!(
+        "当前模式: {} | 当前模型: {}",
+        agent.mode(),
+        agent.model()
+    )));
     while let Some(command) = commands.recv().await {
         match command {
             AgentCommand::Shutdown => break,
@@ -437,6 +451,18 @@ async fn agent_worker(
                 },
                 Err(error) => {
                     emit_event(TuiEvent::Error(format!("错误: {error}")));
+                }
+            },
+            AgentCommand::SetModel(raw_model) => match agent.set_model(raw_model) {
+                Ok(()) => {
+                    emit_event(TuiEvent::Info(format!(
+                        "已切换主控模型: {}。",
+                        agent.model()
+                    )));
+                    emit_event(TuiEvent::Info(format!("当前模型: {}", agent.model())));
+                }
+                Err(error) => {
+                    emit_event(TuiEvent::Error(format!("切换模型失败: {error:#}")));
                 }
             },
             AgentCommand::Session(command) => {
@@ -487,7 +513,7 @@ impl FullscreenApp {
             scroll: 0,
             history: Vec::new(),
             history_index: None,
-            status: "模式 agent | 模型 Claude-Opus-4.6 | tokens 0 | $0.000000".to_string(),
+            status: format!("模式 agent | 模型 {DEFAULT_MODEL} | tokens 0 | $0.000000"),
             busy: false,
             pending: None,
         }
@@ -587,10 +613,12 @@ impl FullscreenApp {
                 turn,
                 session,
                 context_tokens,
+                model,
             } => {
                 self.busy = false;
                 self.status = format!(
-                    "本轮 {:.1}s req {} tokens {} ${:.6} | 会话 {:.1}s req {} tokens {} ${:.6} | 上下文 {}",
+                    "模型 {} | 本轮 {:.1}s req {} tokens {} ${:.6} | 会话 {:.1}s req {} tokens {} ${:.6} | 上下文 {}",
+                    model,
                     turn.elapsed_ms as f32 / 1000.0,
                     turn.request_count,
                     turn.total_tokens(),
@@ -644,6 +672,10 @@ impl FullscreenApp {
             "/mode" => self.push(LogLine::info(mode_text())),
             _ if input.starts_with("/mode ") => {
                 let _ = command_tx.send(AgentCommand::SetMode(input[6..].to_string()));
+            }
+            "/model" => self.push(LogLine::info(model_text())),
+            _ if input.starts_with("/model ") => {
+                let _ = command_tx.send(AgentCommand::SetModel(input[7..].to_string()));
             }
             _ if input.starts_with("/session") => {
                 let _ = command_tx.send(AgentCommand::Session(input[8..].trim().to_string()));
@@ -1069,6 +1101,8 @@ fn help_text() -> String {
         "/clear 清空当前对话上下文",
         "/mode 查看可选模式",
         "/mode <模式> 切换模式",
+        "/model 查看模型切换用法",
+        "/model <模型名> 切换本会话主控模型",
         "/session help 查看会话命令",
         "/exit 退出",
         "Enter 发送，Ctrl+J 换行，↑↓ 翻历史，Tab 应用补全，PageUp/PageDown 预留滚动。",
@@ -1083,6 +1117,10 @@ fn mode_text() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("可选模式: {modes}\n用法: /mode chat 或 /mode agent")
+}
+
+fn model_text() -> String {
+    format!("默认主控模型: {DEFAULT_MODEL}\n用法: /model DeepSeek-V4-pro")
 }
 
 fn session_help_text() -> String {
@@ -1107,6 +1145,8 @@ fn command_completions() -> Vec<&'static str> {
         "/mode agent",
         "/mode team",
         "/mode analyze",
+        "/model",
+        "/model DeepSeek-V4-pro",
         "/session",
         "/session list",
         "/session save",

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const DEFAULT_BASE_URL: &str = "https://yunzhiapi.cn/v1";
-pub const DEFAULT_MODEL: &str = "Gemini-3.5-Flash";
+pub const DEFAULT_MODEL: &str = "DeepSeek-V4-pro";
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn serializes_tool_choice_auto_when_tools_exist() {
         let body = ChatCompletionsRequest {
-            model: "Gemini-3.5-Flash",
+            model: DEFAULT_MODEL,
             max_tokens: 4096,
             stream: true,
             messages: Vec::new(),
@@ -619,6 +619,11 @@ mod tests {
         };
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn default_model_is_deepseek_v4_pro() {
+        assert_eq!(DEFAULT_MODEL, "DeepSeek-V4-pro");
     }
 
     #[test]
