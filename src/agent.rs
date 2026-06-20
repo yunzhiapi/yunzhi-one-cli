@@ -1,4 +1,5 @@
 use crate::config::load_project_memory;
+use crate::extensions::render_skills_index;
 use crate::llm::{ChatRequest, LlmClient, ToolChoice};
 use crate::tools::{PermissionPrompter, PermissionRequest, ToolContext, ToolRegistry};
 use crate::tui;
@@ -17,6 +18,9 @@ const PLAN_READ_ONLY_TOOLS: &[&str] = &[
     "grep_search",
     "file_info",
     "list_models",
+    "list_skills",
+    "read_skill",
+    "list_mcp_servers",
 ];
 
 pub struct Agent<C: LlmClient> {
@@ -249,11 +253,17 @@ fn build_system_prompt(mode: AgentMode) -> Result<String> {
         system_prompt.push_str("\n\n项目记忆 (.yunzhi/memory.md):\n");
         system_prompt.push_str(&memory);
     }
+    if let Some(skills) = render_skills_index(&std::env::current_dir()?)? {
+        system_prompt.push_str("\n\n可用 Skills (.yunzhi/skills 与 ~/.yunzhi/skills):\n");
+        system_prompt.push_str(&skills);
+        system_prompt
+            .push_str("\n需要使用某个 Skill 时，先调用 read_skill 读取完整说明，再按说明执行。");
+    }
     Ok(system_prompt)
 }
 
 fn base_system_prompt() -> String {
-    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Gemini-3.5-Flash。你可以调用工具读取、搜索、编辑、追加、复制、移动、删除文件，创建目录，查看文件元信息，执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，也可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。\n\n关键规则：\n1. 凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须立即调用对应工具完成，不要用自然语言描述你将要做什么。\n2. 禁止在没有实际调用工具并收到工具结果前，使用「我将...」「正在...」「马上...」「请稍等」「已经完成」「已经创建」「已经写入」等表述。\n3. 如果需要用户提供更多信息（如文件名、路径），简短询问即可，一旦信息齐全立即调用工具。\n4. bash、execute_code、run_program、copy_path、move_path、delete_path、kill_process 等危险操作会自动请求用户确认，其他常规文件读写操作已预授权。\n5. 优先给出简洁、准确、可执行的回答。".to_string()
+    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Gemini-3.5-Flash。你可以调用工具读取、搜索、编辑、追加、复制、移动、删除文件，创建目录，查看文件元信息，执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，读取并使用 Skills，也可以通过 MCP server 调用外部工具，还可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。\n\n关键规则：\n1. 凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须立即调用对应工具完成，不要用自然语言描述你将要做什么。\n2. 禁止在没有实际调用工具并收到工具结果前，使用「我将...」「正在...」「马上...」「请稍等」「已经完成」「已经创建」「已经写入」等表述。\n3. 如果用户请求适合某个 Skill，先调用 read_skill 获取完整说明再执行；如果需要外部 MCP 能力，先调用 list_mcp_servers 确认可用 server。\n4. 如果需要用户提供更多信息（如文件名、路径），简短询问即可，一旦信息齐全立即调用工具。\n5. bash、execute_code、run_program、copy_path、move_path、delete_path、kill_process、call_mcp_tool 等危险操作会自动请求用户确认，其他常规文件读写操作已预授权。\n6. 优先给出简洁、准确、可执行的回答。".to_string()
 }
 
 fn looks_like_unverified_completion(text: &str) -> bool {
@@ -433,8 +443,12 @@ mod tests {
     fn plan_read_only_tools_exclude_mutating_tools() {
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"read_file"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"list_skills"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"read_skill"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"list_mcp_servers"));
         assert!(!PLAN_READ_ONLY_TOOLS.contains(&"write_file"));
         assert!(!PLAN_READ_ONLY_TOOLS.contains(&"bash"));
+        assert!(!PLAN_READ_ONLY_TOOLS.contains(&"call_mcp_tool"));
         assert!(!PLAN_READ_ONLY_TOOLS.contains(&"run_program"));
     }
 }

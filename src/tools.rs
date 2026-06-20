@@ -1,3 +1,4 @@
+use crate::extensions::{call_mcp_tool, load_mcp_servers, read_skill, skills_index};
 use crate::llm::ChatCompletionsClient;
 use crate::types::{ToolDefinition, ToolOutput};
 use anyhow::{anyhow, Context, Result};
@@ -98,6 +99,9 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "grep_search"
             | "manage_todos"
             | "list_models"
+            | "list_skills"
+            | "read_skill"
+            | "list_mcp_servers"
             | "call_model"
     )
 }
@@ -158,6 +162,10 @@ impl ToolRegistry {
         registry.register(GrepSearchTool);
         registry.register(ListDirTool);
         registry.register(ListModelsTool);
+        registry.register(ListSkillsTool);
+        registry.register(ReadSkillTool);
+        registry.register(ListMcpServersTool);
+        registry.register(CallMcpTool);
         registry.register(CallModelTool);
         registry.register(ExecuteCodeTool);
         registry.register(RunProgramTool);
@@ -769,6 +777,141 @@ impl Tool for ListModelsTool {
 
 struct CallModelTool;
 
+struct ListSkillsTool;
+
+#[async_trait]
+impl Tool for ListSkillsTool {
+    fn name(&self) -> &'static str {
+        "list_skills"
+    }
+    fn description(&self) -> &'static str {
+        "列出项目级和用户级 Skills，来源为 .yunzhi/skills 与 ~/.yunzhi/skills"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"hint":{"type":"string","description":"可选，说明要寻找的技能类型"}}})
+    }
+    async fn execute(&self, _args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let skills = skills_index(&context.cwd)?;
+        if skills.is_empty() {
+            return Ok(ToolOutput::ok("未发现 Skills"));
+        }
+        let rendered = skills
+            .into_iter()
+            .map(|skill| {
+                format!(
+                    "{}\t{}\t{}",
+                    skill.id,
+                    skill.description,
+                    skill.path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolOutput::ok(rendered))
+    }
+}
+
+struct ReadSkillTool;
+
+#[async_trait]
+impl Tool for ReadSkillTool {
+    fn name(&self) -> &'static str {
+        "read_skill"
+    }
+    fn description(&self) -> &'static str {
+        "读取指定 Skill 的完整 Markdown 说明，按 id 或路径查找"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"skill":{"type":"string","description":"Skill id 或路径"}},"required":["skill"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let (skill, content) = read_skill(&context.cwd, &string_arg(&args, "skill")?)?;
+        Ok(ToolOutput::ok(format!(
+            "Skill: {}\nPath: {}\n\n{}",
+            skill.id,
+            skill.path.display(),
+            content
+        )))
+    }
+}
+
+struct ListMcpServersTool;
+
+#[async_trait]
+impl Tool for ListMcpServersTool {
+    fn name(&self) -> &'static str {
+        "list_mcp_servers"
+    }
+    fn description(&self) -> &'static str {
+        "列出 .yunzhi/mcp.json 与 ~/.yunzhi/mcp.json 中配置的 MCP stdio server"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"hint":{"type":"string","description":"可选，说明要寻找的 MCP 能力"}}})
+    }
+    async fn execute(&self, _args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let servers = load_mcp_servers(&context.cwd)?;
+        if servers.is_empty() {
+            return Ok(ToolOutput::ok("未配置 MCP servers"));
+        }
+        let rendered = servers
+            .into_iter()
+            .map(|(name, server)| {
+                let args = if server.args.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {}",
+                        shell_words::join(server.args.iter().map(String::as_str))
+                    )
+                };
+                format!("{}\t{}{}", name, server.command, args)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolOutput::ok(rendered))
+    }
+}
+
+struct CallMcpTool;
+
+#[async_trait]
+impl Tool for CallMcpTool {
+    fn name(&self) -> &'static str {
+        "call_mcp_tool"
+    }
+    fn description(&self) -> &'static str {
+        "通过 stdio JSON-RPC 调用已配置 MCP server 的工具，执行前请求确认"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "server":{"type":"string","description":"MCP server 名称"},
+                "tool":{"type":"string","description":"MCP 工具名称"},
+                "arguments":{"type":"object","description":"传给 MCP 工具的 JSON 参数"},
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+            },
+            "required":["server","tool"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let server = string_arg(&args, "server")?;
+        let tool = string_arg(&args, "tool")?;
+        let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        anyhow::ensure!(arguments.is_object(), "arguments 必须是对象");
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        context
+            .confirm(PermissionRequest {
+                tool_name: self.name().to_string(),
+                summary: format!("调用 MCP 工具 {server}/{tool}"),
+                diff: None,
+            })
+            .await?;
+        let result = call_mcp_tool(&context.cwd, &server, &tool, arguments, timeout_secs).await?;
+        Ok(ToolOutput::ok(serde_json::to_string_pretty(&result)?))
+    }
+}
+
 #[async_trait]
 impl Tool for CallModelTool {
     fn name(&self) -> &'static str {
@@ -1285,6 +1428,49 @@ mod tests {
             .execute("system_control", json!({"action":"pwd"}), &mut ctx)
             .await;
         assert_eq!(output.content, dir.path().display().to_string());
+    }
+
+    #[tokio::test]
+    async fn lists_and_reads_skills() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join(".yunzhi/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Review helper\n---\n# Review\nUse care.",
+        )
+        .unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+
+        let output = registry.execute("list_skills", json!({}), &mut ctx).await;
+        assert!(output.content.contains("review"));
+        assert!(output.content.contains("Review helper"));
+
+        let output = registry
+            .execute("read_skill", json!({"skill":"review"}), &mut ctx)
+            .await;
+        assert!(output.content.contains("Use care."));
+    }
+
+    #[tokio::test]
+    async fn lists_mcp_servers() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join(".yunzhi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("mcp.json"),
+            r#"{"servers":{"demo":{"command":"echo","args":["ok"]}}}"#,
+        )
+        .unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+
+        let output = registry
+            .execute("list_mcp_servers", json!({}), &mut ctx)
+            .await;
+        assert!(output.content.contains("demo"));
+        assert!(output.content.contains("echo ok"));
     }
 
     #[tokio::test]

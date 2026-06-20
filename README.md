@@ -51,8 +51,10 @@ yunzhi
 - 支持 `--mode` 选择智能体模式，交互中也可以用 `/mode` 查看和切换。
 - 内置模式：`chat`、`plan-act`、`entanglement`、`agent`、`team`、`analyze`。
 - 预留 `LlmClient` trait，真实接口格式变化时可替换适配层。
-- 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`list_models`、`manage_todos`、`system_control`、`call_model`。
+- 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`list_models`、`list_skills`、`read_skill`、`list_mcp_servers`、`call_mcp_tool`、`manage_todos`、`system_control`、`call_model`。
 - 主模型可以通过 `list_models` 读取云智 API 可用模型列表，并通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
+- 支持本地 Skill：启动时索引 `.yunzhi/skills` 与 `~/.yunzhi/skills`，模型可用 `list_skills` 查看技能，用 `read_skill` 读取完整 Markdown 指令后执行。
+- 支持 MCP stdio server：读取 `.yunzhi/mcp.json` 与 `~/.yunzhi/mcp.json`，模型可用 `list_mcp_servers` 查看 server，用 `call_mcp_tool` 发起 JSON-RPC 工具调用。
 - 写文件、编辑文件、追加文件、复制路径、移动路径、删除路径、执行 bash、执行代码、运行程序和终止进程默认需要确认，支持 `--dangerously-skip-permissions` 跳过。
 - `manage_todos` 在当前会话中维护任务列表，支持新增、更新、列出和清空。
 - `system_control` 提供受控系统操作：查看工作目录、环境变量、进程列表、磁盘信息和终止进程。
@@ -68,6 +70,33 @@ yunzhi
 - `agent`：默认自主开发模式，需求清楚时直接强制调用工具读写、运行和验证，由工具层负责 diff 和权限确认。
 - `team`：主模型担任调度器，先读取可用模型列表，再按架构、实现、测试、审查等角色把任务分配给不同子智能体；一个子智能体完成后，主模型把交付物作为上下文唤醒下一位子智能体。
 - `analyze`：只读分析、定位风险和比较方案优先，适合评审和排查。
+
+## Skills 与 MCP
+
+Skill 是可复用的 Markdown 指令文件。项目级 Skill 放在 `.yunzhi/skills`，用户级 Skill 放在 `~/.yunzhi/skills`；可以使用 `name.md`，也可以使用 `name/SKILL.md`。文件开头可写 frontmatter：
+
+```markdown
+---
+description: Rust 代码审查流程
+---
+# Rust Review
+```
+
+MCP server 使用 JSON 配置。项目级配置为 `.yunzhi/mcp.json`，用户级配置为 `~/.yunzhi/mcp.json`，支持 `mcpServers` 或 `servers` 字段：
+
+```json
+{
+	"mcpServers": {
+		"filesystem": {
+			"command": "node",
+			"args": ["./mcp-filesystem-server.js"],
+			"env": {}
+		}
+	}
+}
+```
+
+`call_mcp_tool` 会按 MCP stdio JSON-RPC 初始化 server，并调用 `tools/call`。由于会启动外部进程，默认需要权限确认。
 
 ## 设计取舍
 
