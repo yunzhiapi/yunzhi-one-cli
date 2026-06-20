@@ -51,12 +51,13 @@ yunzhi
 - 支持 `--mode` 选择智能体模式，交互中也可以用 `/mode` 查看和切换。
 - 内置模式：`chat`、`plan-act`、`entanglement`、`agent`、`team`、`analyze`。
 - 预留 `LlmClient` trait，真实接口格式变化时可替换适配层。
-- 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`list_models`、`list_skills`、`read_skill`、`list_mcp_servers`、`call_mcp_tool`、`manage_todos`、`system_control`、`call_model`。
+- 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`ask_user`、`choose_option`、`list_models`、`list_skills`、`read_skill`、`list_mcp_servers`、`call_mcp_tool`、`manage_todos`、`system_control`、`call_model`。
 - 主模型可以通过 `list_models` 读取云智 API 可用模型列表，并通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
 - 支持本地 Skill：启动时索引 `.yunzhi/skills` 与 `~/.yunzhi/skills`，模型可用 `list_skills` 查看技能，用 `read_skill` 读取完整 Markdown 指令后执行。
 - 支持 MCP stdio server：读取 `.yunzhi/mcp.json` 与 `~/.yunzhi/mcp.json`，模型可用 `list_mcp_servers` 查看 server，用 `call_mcp_tool` 发起 JSON-RPC 工具调用。
 - 写文件、编辑文件、追加文件、复制路径、移动路径、删除路径、执行 bash、执行代码、运行程序和终止进程默认需要确认，支持 `--dangerously-skip-permissions` 跳过。
 - `manage_todos` 在当前会话中维护任务列表，支持新增、更新、列出和清空。
+- `ask_user` 支持 AI 在信息不足时向用户提问并读取自由文本回答；`choose_option` 支持 AI 给出候选项并让用户选择，也可允许自定义答案。
 - `system_control` 提供受控系统操作：查看工作目录、环境变量、进程列表、磁盘信息和终止进程。
 - 启动时读取项目级 `.yunzhi/memory.md` 并注入 system prompt。
 - 对话历史保存在内存中，超过阈值后做简单摘要压缩。

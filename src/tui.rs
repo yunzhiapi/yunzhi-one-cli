@@ -1,4 +1,7 @@
-use crate::tools::{PermissionDecision, PermissionPrompter, PermissionRequest};
+use crate::tools::{
+    PermissionDecision, PermissionPrompter, PermissionRequest, UserChoiceRequest,
+    UserChoiceResponse, UserQuestionRequest,
+};
 use crate::types::AgentMode;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -107,6 +110,68 @@ impl PermissionPrompter for StdoutPrompter {
                 "n" | "no" => return Ok(PermissionDecision::Deny),
                 _ => println!("请输入 y、n 或 a。"),
             }
+        }
+    }
+
+    async fn ask_user(&self, request: UserQuestionRequest) -> Result<String> {
+        println!("{}", "需要用户输入".yellow().bold());
+        if let Some(context) = request.context {
+            println!("{}", context);
+        }
+        loop {
+            match &request.default_answer {
+                Some(default_answer) => print!("{} [{}]: ", request.question, default_answer),
+                None => print!("{}: ", request.question),
+            }
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let answer = input.trim().to_string();
+            if !answer.is_empty() {
+                return Ok(answer);
+            }
+            if let Some(default_answer) = &request.default_answer {
+                return Ok(default_answer.clone());
+            }
+            println!("请输入答案。")
+        }
+    }
+
+    async fn choose_option(&self, request: UserChoiceRequest) -> Result<UserChoiceResponse> {
+        println!("{}", "需要用户选择".yellow().bold());
+        if let Some(context) = request.context {
+            println!("{}", context);
+        }
+        println!("{}", request.question);
+        for (index, option) in request.options.iter().enumerate() {
+            println!("  {}. {}", index + 1, option);
+        }
+        if request.allow_custom {
+            println!("也可以直接输入自定义答案。")
+        }
+        loop {
+            print!("请选择 [1-{}]: ", request.options.len());
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let answer = input.trim();
+            if let Ok(choice) = answer.parse::<usize>() {
+                if (1..=request.options.len()).contains(&choice) {
+                    return Ok(UserChoiceResponse {
+                        answer: request.options[choice - 1].clone(),
+                        index: Some(choice - 1),
+                        custom: false,
+                    });
+                }
+            }
+            if request.allow_custom && !answer.is_empty() {
+                return Ok(UserChoiceResponse {
+                    answer: answer.to_string(),
+                    index: None,
+                    custom: true,
+                });
+            }
+            println!("请输入 1 到 {} 之间的序号。", request.options.len());
         }
     }
 }

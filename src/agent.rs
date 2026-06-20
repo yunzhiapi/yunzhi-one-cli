@@ -17,6 +17,8 @@ const PLAN_READ_ONLY_TOOLS: &[&str] = &[
     "glob_search",
     "grep_search",
     "file_info",
+    "ask_user",
+    "choose_option",
     "list_models",
     "list_skills",
     "read_skill",
@@ -28,6 +30,8 @@ const ANALYZE_READ_ONLY_TOOLS: &[&str] = &[
     "glob_search",
     "grep_search",
     "file_info",
+    "ask_user",
+    "choose_option",
     "list_models",
     "call_model",
     "list_skills",
@@ -283,7 +287,7 @@ fn build_system_prompt(mode: AgentMode) -> Result<String> {
 }
 
 fn base_system_prompt() -> String {
-    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Gemini-3.5-Flash。你可以调用工具读取、搜索、编辑、追加、复制、移动、删除文件，创建目录，查看文件元信息，执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，读取并使用 Skills，也可以通过 MCP server 调用外部工具，还可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。\n\n关键规则：\n1. 凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须立即调用对应工具完成，不要用自然语言描述你将要做什么。\n2. 禁止在没有实际调用工具并收到工具结果前，使用「我将...」「正在...」「马上...」「请稍等」「已经完成」「已经创建」「已经写入」等表述。\n3. 如果用户请求适合某个 Skill，先调用 read_skill 获取完整说明再执行；如果需要外部 MCP 能力，先调用 list_mcp_servers 确认可用 server。\n4. 如果需要用户提供更多信息（如文件名、路径），简短询问即可，一旦信息齐全立即调用工具。\n5. bash、execute_code、run_program、copy_path、move_path、delete_path、kill_process、call_mcp_tool 等危险操作会自动请求用户确认，其他常规文件读写操作已预授权。\n6. 优先给出简洁、准确、可执行的回答。".to_string()
+    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Gemini-3.5-Flash。你可以调用工具读取、搜索、编辑、追加、复制、移动、删除文件，创建目录，查看文件元信息，执行命令、执行代码片段、运行程序、管理和跟踪代办任务、询问用户、让用户选择选项、执行受控系统操作，读取并使用 Skills，也可以通过 MCP server 调用外部工具，还可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。\n\n关键规则：\n1. 凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须立即调用对应工具完成，不要用自然语言描述你将要做什么。\n2. 禁止在没有实际调用工具并收到工具结果前，使用「我将...」「正在...」「马上...」「请稍等」「已经完成」「已经创建」「已经写入」等表述。\n3. 如果用户请求适合某个 Skill，先调用 read_skill 获取完整说明再执行；如果需要外部 MCP 能力，先调用 list_mcp_servers 确认可用 server。\n4. 如果缺少必要信息，优先用 ask_user 收集自由文本；如果需要用户在多个方案、文件、模式或配置之间决策，优先用 choose_option 发起选择；一旦信息齐全立即调用后续工具。\n5. bash、execute_code、run_program、copy_path、move_path、delete_path、kill_process、call_mcp_tool 等危险操作会自动请求用户确认，其他常规文件读写操作和用户问答/选择已预授权。\n6. 优先给出简洁、准确、可执行的回答。".to_string()
 }
 
 fn looks_like_unverified_completion(text: &str) -> bool {
@@ -430,6 +434,22 @@ impl PermissionPrompter for DenyPrompter {
     ) -> Result<crate::tools::PermissionDecision> {
         Ok(crate::tools::PermissionDecision::Deny)
     }
+
+    async fn ask_user(&self, request: crate::tools::UserQuestionRequest) -> Result<String> {
+        Ok(request.default_answer.unwrap_or_default())
+    }
+
+    async fn choose_option(
+        &self,
+        request: crate::tools::UserChoiceRequest,
+    ) -> Result<crate::tools::UserChoiceResponse> {
+        let answer = request.options.first().cloned().unwrap_or_default();
+        Ok(crate::tools::UserChoiceResponse {
+            answer,
+            index: Some(0),
+            custom: false,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +514,8 @@ mod tests {
     fn plan_read_only_tools_exclude_mutating_tools() {
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"read_file"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"ask_user"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"choose_option"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"list_skills"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"read_skill"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"list_mcp_servers"));
@@ -507,6 +529,8 @@ mod tests {
     fn analyze_tools_are_read_only() {
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"read_file"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"ask_user"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"choose_option"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"call_model"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"read_skill"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"list_mcp_servers"));

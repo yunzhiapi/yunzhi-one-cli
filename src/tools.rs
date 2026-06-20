@@ -26,6 +26,8 @@ pub enum PermissionDecision {
 #[async_trait]
 pub trait PermissionPrompter: Send + Sync {
     async fn confirm(&self, request: PermissionRequest) -> Result<PermissionDecision>;
+    async fn ask_user(&self, request: UserQuestionRequest) -> Result<String>;
+    async fn choose_option(&self, request: UserChoiceRequest) -> Result<UserChoiceResponse>;
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,28 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub summary: String,
     pub diff: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserQuestionRequest {
+    pub question: String,
+    pub context: Option<String>,
+    pub default_answer: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserChoiceRequest {
+    pub question: String,
+    pub context: Option<String>,
+    pub options: Vec<String>,
+    pub allow_custom: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChoiceResponse {
+    pub answer: String,
+    pub index: Option<usize>,
+    pub custom: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +122,8 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "glob_search"
             | "grep_search"
             | "manage_todos"
+            | "ask_user"
+            | "choose_option"
             | "list_models"
             | "list_skills"
             | "read_skill"
@@ -167,6 +193,8 @@ impl ToolRegistry {
         registry.register(ListMcpServersTool);
         registry.register(CallMcpTool);
         registry.register(CallModelTool);
+        registry.register(AskUserTool);
+        registry.register(ChooseOptionTool);
         registry.register(ExecuteCodeTool);
         registry.register(RunProgramTool);
         registry.register(ManageTodosTool);
@@ -777,6 +805,107 @@ impl Tool for ListModelsTool {
 
 struct CallModelTool;
 
+struct AskUserTool;
+
+#[async_trait]
+impl Tool for AskUserTool {
+    fn name(&self) -> &'static str {
+        "ask_user"
+    }
+    fn description(&self) -> &'static str {
+        "向用户提出一个需要自由文本回答的问题，并把用户回答返回给模型"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "question":{"type":"string","description":"要询问用户的问题，必须简短明确"},
+                "context":{"type":"string","description":"可选，说明为什么需要这个信息"},
+                "default_answer":{"type":"string","description":"可选，用户直接回车时采用的默认答案"}
+            },
+            "required":["question"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let question = string_arg(&args, "question")?;
+        let response = context
+            .prompter
+            .ask_user(UserQuestionRequest {
+                question,
+                context: args
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                default_answer: args
+                    .get("default_answer")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            })
+            .await?;
+        Ok(ToolOutput::ok(response))
+    }
+}
+
+struct ChooseOptionTool;
+
+#[async_trait]
+impl Tool for ChooseOptionTool {
+    fn name(&self) -> &'static str {
+        "choose_option"
+    }
+    fn description(&self) -> &'static str {
+        "让用户从一组候选项中选择一个选项，可选支持自定义输入，并把选择结果返回给模型"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "question":{"type":"string","description":"要让用户选择的问题，必须简短明确"},
+                "context":{"type":"string","description":"可选，说明每个选项的背景或取舍"},
+                "options":{"type":"array","items":{"type":"string"},"description":"候选项列表，至少 2 项"},
+                "allow_custom":{"type":"boolean","description":"是否允许用户输入不在候选项内的自定义答案，默认 false"}
+            },
+            "required":["question","options"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let question = string_arg(&args, "question")?;
+        let options = args
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("options 必须是字符串数组"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("options 必须全部是字符串"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(options.len() >= 2, "options 至少需要 2 项");
+        let response = context
+            .prompter
+            .choose_option(UserChoiceRequest {
+                question,
+                context: args
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                options,
+                allow_custom: args
+                    .get("allow_custom")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+            .await?;
+        Ok(ToolOutput::ok(serde_json::to_string_pretty(&json!({
+            "answer": response.answer,
+            "index": response.index,
+            "custom": response.custom,
+        }))?))
+    }
+}
+
 struct ListSkillsTool;
 
 #[async_trait]
@@ -1314,6 +1443,46 @@ impl PermissionPrompter for AlwaysAllowPrompter {
     async fn confirm(&self, _request: PermissionRequest) -> Result<PermissionDecision> {
         Ok(PermissionDecision::Allow)
     }
+
+    async fn ask_user(&self, request: UserQuestionRequest) -> Result<String> {
+        Ok(request.default_answer.unwrap_or_default())
+    }
+
+    async fn choose_option(&self, request: UserChoiceRequest) -> Result<UserChoiceResponse> {
+        let answer = request
+            .options
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("options 不能为空"))?;
+        Ok(UserChoiceResponse {
+            answer,
+            index: Some(0),
+            custom: false,
+        })
+    }
+}
+
+#[cfg(test)]
+struct FixedUserPrompter;
+
+#[cfg(test)]
+#[async_trait]
+impl PermissionPrompter for FixedUserPrompter {
+    async fn confirm(&self, _request: PermissionRequest) -> Result<PermissionDecision> {
+        Ok(PermissionDecision::Allow)
+    }
+
+    async fn ask_user(&self, _request: UserQuestionRequest) -> Result<String> {
+        Ok("用户回答".to_string())
+    }
+
+    async fn choose_option(&self, request: UserChoiceRequest) -> Result<UserChoiceResponse> {
+        Ok(UserChoiceResponse {
+            answer: request.options[1].clone(),
+            index: Some(1),
+            custom: false,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1327,6 +1496,16 @@ mod tests {
             "test-key".to_string(),
             true,
             Arc::new(AlwaysAllowPrompter),
+            false,
+        )
+    }
+
+    fn fixed_user_context(dir: &Path) -> ToolContext {
+        ToolContext::new(
+            dir.to_path_buf(),
+            "test-key".to_string(),
+            true,
+            Arc::new(FixedUserPrompter),
             false,
         )
     }
@@ -1401,6 +1580,55 @@ mod tests {
             )
             .await;
         assert!(output.content.contains("Done"));
+    }
+
+    #[tokio::test]
+    async fn asks_user_for_free_text() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = fixed_user_context(dir.path());
+        let output = registry
+            .execute(
+                "ask_user",
+                json!({"question":"目标文件名是什么？","context":"需要确定写入路径"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content, "用户回答");
+    }
+
+    #[tokio::test]
+    async fn chooses_user_option() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = fixed_user_context(dir.path());
+        let output = registry
+            .execute(
+                "choose_option",
+                json!({"question":"选择模式","options":["chat","agent","team"]}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("agent"));
+        assert!(output.content.contains("\"index\": 1"));
+        assert!(output.content.contains("\"custom\": false"));
+    }
+
+    #[tokio::test]
+    async fn choose_option_requires_two_options() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = fixed_user_context(dir.path());
+        let output = registry
+            .execute(
+                "choose_option",
+                json!({"question":"选择模式","options":["agent"]}),
+                &mut ctx,
+            )
+            .await;
+        assert!(output.is_error);
     }
 
     #[tokio::test]
