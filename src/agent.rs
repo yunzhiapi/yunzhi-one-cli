@@ -219,6 +219,9 @@ impl<C: LlmClient> Agent<C> {
                 input
             );
         }
+        if matches!(self.options.mode, AgentMode::Entanglement) {
+            return entanglement_turn_input(&input);
+        }
         input
     }
 
@@ -367,11 +370,18 @@ fn is_act_approval(input: &str) -> bool {
     )
 }
 
+fn entanglement_turn_input(input: &str) -> String {
+    format!(
+        "纠缠模式任务。请把用户目标、代码上下文、工具结果、可用 Skills/MCP、可用模型和不确定性视为同一个协同系统处理。\n\n执行协议：\n1. 先建立纠缠图：列出目标、相关文件/命令/模型/外部能力、约束、风险和未知数。\n2. 对未知数主动调用只读工具求证；如果任务需要专门视角或反证，先用 list_models 获取候选模型，再用 call_model 委托至少一个子模型做独立检查。\n3. 形成假设矩阵：主假设、反假设、证据、反证、置信度和下一步动作。\n4. 如果需要改动文件或执行命令，先说明证据链，再调用对应工具完成；不要仅凭猜测修改。\n5. 每轮总结必须包含：已确认事实、仍纠缠的问题、被唤醒的下一上下文或子模型、最终建议/交付物。\n\n用户请求:\n{}",
+        input
+    )
+}
+
 fn mode_prompt(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Chat => "chat 模式：以解释、问答和轻量建议为主。除非用户明确要求修改或运行，否则优先不调用会改变环境的工具。",
         AgentMode::PlanAct => "plan&act 模式：第一轮只能制定计划，可以使用只读工具读取文件、列目录、搜索和查看信息；严禁写入、编辑、删除、执行命令或运行程序。计划末尾提示用户输入 act。只有用户明确输入 act 后，才进入执行阶段，并按计划编辑、运行和验证。",
-        AgentMode::Entanglement => "entanglement 模式：把用户、代码、工具和其他模型视为协同上下文；主动交叉检查关键判断，在复杂任务中用 call_model 分离子问题。",
+        AgentMode::Entanglement => "entanglement 模式：把用户目标、代码、工具、Skills、MCP、可用模型和不确定性视为同一个协同系统。先建立纠缠图和假设矩阵，再用只读工具求证关键事实；复杂或高风险判断必须通过 call_model 做独立反证或交叉检查。修改前先给出证据链，完成后总结已确认事实、剩余纠缠点和下一位被唤醒的上下文/子模型。",
         AgentMode::Agent => "agent 模式：默认自主完成软件开发任务；在需求清楚时必须直接调用工具读取、编辑、测试和总结，不要用对话确认替代工具操作，遇到高风险操作由工具权限确认接管。",
         AgentMode::Team => "team 模式：主模型担任 CEO/调度器。每个新任务第一步必须调用 list_models 获取可用模型列表，然后按需求用 call_model 分配子智能体任务。子智能体可处于 waiting/running/done 状态；某智能体完成后，主模型根据交付物唤醒下一位智能体，并把必要上下文传给它，形成一个人一个公司的流水线。",
         AgentMode::Analyze => "analyze 模式：以只读分析、定位问题、风险评估和方案比较为主；除非用户明确授权，避免修改文件或执行破坏性操作。",
@@ -430,6 +440,15 @@ mod tests {
             tool_choice_for_input(AgentMode::Team, "实现一个功能"),
             ToolChoice::Function("list_models".to_string())
         );
+    }
+
+    #[test]
+    fn entanglement_wraps_turn_with_protocol() {
+        let prepared = entanglement_turn_input("分析一个复杂问题");
+        assert!(prepared.contains("纠缠图"));
+        assert!(prepared.contains("假设矩阵"));
+        assert!(prepared.contains("call_model"));
+        assert!(prepared.contains("用户请求:\n分析一个复杂问题"));
     }
 
     #[test]
