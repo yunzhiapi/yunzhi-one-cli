@@ -429,11 +429,29 @@ fn parse_sse_event(
             }
         }
     }
-    if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls") {
-        events.extend(finish_pending_tools(pending_tools));
-    } else if choice.get("finish_reason").and_then(Value::as_str) == Some("stop") {
-        events.push(StreamEvent::MessageStop);
+    
+    // 检查是否有 finish_reason
+    if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        // 无论什么 finish_reason，都先完成待处理的工具调用
+        if !pending_tools.is_empty() {
+            events.extend(finish_pending_tools(pending_tools));
+        }
+        
+        // 然后根据 finish_reason 添加相应事件
+        match finish_reason {
+            "tool_calls" => {
+                // 工具调用已在上面处理
+            }
+            "stop" | "end_turn" | "max_tokens" | "length" => {
+                events.push(StreamEvent::MessageStop);
+            }
+            _ => {
+                // 未知的 finish_reason，也发送 MessageStop
+                events.push(StreamEvent::MessageStop);
+            }
+        }
     }
+    
     Ok(events)
 }
 
@@ -455,9 +473,6 @@ fn finish_pending_tools(pending_tools: &mut BTreeMap<usize, PendingTool>) -> Vec
             name: tool.name,
             input,
         }));
-    }
-    if events.is_empty() {
-        events.push(StreamEvent::MessageStop);
     }
     events
 }
